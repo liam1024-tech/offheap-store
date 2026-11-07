@@ -25,6 +25,6 @@ jobs:
         settings-path: ${{ github.workspace }}
 
     - name: Deploy Package to GitHub Packages Registry
-      run: mvn -B deploy -DskipTests
+      run: mvn -B deploy -DskipTests -s ${{ github.workspace }}/settings.xml
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
