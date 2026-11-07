@@ -1365,6 +1365,13 @@ public class PersistentOffHeapStore implements AutoCloseable {
         }
     }
 
+    /**
+     * Alias for {@link #sync()} to conform with standard flush semantics.
+     */
+    public void flush() {
+        sync();
+    }
+
     // =========================================================================
     // 内部底层读写与校验实现 (基于 FFM 硬件内联 Intrinsic 拷贝与比对)
     // =========================================================================
