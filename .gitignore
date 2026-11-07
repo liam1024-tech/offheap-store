@@ -1,0 +1,37 @@
+# Maven & Gradle build artifacts
+target/
+build/
+.gradle/
+*.jar
+*.war
+*.ear
+
+# Legacy & IDE output dirs
+bin/
+out/
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+
+# Off-heap runtime data & memory mapped files
+*.dat
+*.wal
+data/
+persistent_offheap_data/
+offheap_data/
+
+# Logs & temp files
+*.log
+*.out
+*.tmp
+*.pid
+tmp/
+
+# OS specific
+.DS_Store
+Thumbs.db

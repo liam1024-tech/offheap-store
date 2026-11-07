@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.github.liam1024-tech</groupId>
+    <artifactId>offheap-store</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Off-Heap Store</name>
+    <description>Ultra high-performance zero-GC off-heap Key-Value cache and persistent store for modern Java (JDK 22-27+) powered by FFM API (JEP 454) and MMAP crash recovery.</description>
+    <url>https://github.com/liam1024-tech/offheap-store</url>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>liam1024-tech</id>
+            <name>Liam</name>
+            <email>158254191+liam1024-tech@users.noreply.github.com</email>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:git://github.com/liam1024-tech/offheap-store.git</connection>
+        <developerConnection>scm:git:ssh://github.com:liam1024-tech/offheap-store.git</developerConnection>
+        <url>https://github.com/liam1024-tech/offheap-store</url>
+    </scm>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>25</maven.compiler.release>
+        <junit.jupiter.version>5.11.4</junit.jupiter.version>
+    </properties>
+
+    <dependencies>
+        <!-- JUnit 5 for unit & integration testing -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Compiler plugin configured for Java 25+ release -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>25</release>
+                </configuration>
+            </plugin>
+
+            <!-- Surefire test plugin configured with native access and assertions -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+                <configuration>
+                    <argLine>--enable-native-access=ALL-UNNAMED -ea</argLine>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
