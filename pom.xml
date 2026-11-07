@@ -41,6 +41,14 @@
         <junit.jupiter.version>5.11.4</junit.jupiter.version>
     </properties>
 
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <name>GitHub Packages</name>
+            <url>https://maven.pkg.github.com/liam1024-tech/offheap-store</url>
+        </repository>
+    </distributionManagement>
+
     <dependencies>
         <!-- JUnit 5 for unit & integration testing -->
         <dependency>
