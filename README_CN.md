@@ -164,6 +164,46 @@ public class DemoInMemory {
 }
 ```
 
+### 3. 高性能批量写入与批量读取（防死锁 BatchPut 与原子快照 BatchGet / GetAll）
+
+```java
+import offheap.PersistentOffHeapStore;
+import java.util.List;
+import java.util.Map;
+
+public class DemoBatchOperations {
+    public static void main(String[] args) {
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.inMemory()) {
+
+            // 1. 多 Key 防死锁原子批量写入 (双 64-bit 条带位掩码升序锁协议，100% 免疫 AB-BA 死锁)
+            Map<byte[], byte[]> batch = Map.of(
+                "order:1001".getBytes(), "status:paid".getBytes(),
+                "order:1002".getBytes(), "status:pending".getBytes(),
+                "order:1003".getBytes(), "status:shipped".getBytes()
+            );
+            int written = store.batchPut(batch, 60_000L); // 携带 60 秒 TTL
+            System.out.println("成功批量写入: " + written + " 条");
+
+            // 2. Redis MGET 风格顺序批量读取 (与 keys 列表下标 1:1 严格对齐，未命中或过期返回 null)
+            List<byte[]> queryKeys = List.of(
+                "order:1001".getBytes(),
+                "order:9999".getBytes(), // 不存在的键
+                "order:1003".getBytes()
+            );
+            List<byte[]> values = store.batchGet(queryKeys);
+            System.out.println("order:1001 状态: " + new String(values.get(0)));
+            System.out.println("order:9999 状态: " + values.get(1)); // null
+            System.out.println("order:1003 状态: " + new String(values.get(2)));
+
+            // 3. Caffeine / JCache 风格内容安全 Map 批量读取 (基于 Arrays::compare 消除 byte[] 引用比较陷阱)
+            Map<byte[], byte[]> hitMap = store.getAll(queryKeys); // 亦可使用别名 store.batchGetMap(queryKeys)
+            System.out.println("命中总数: " + hitMap.size()); // 2 条
+            System.out.println("支持新建等值 byte[] 查找: " + new String(hitMap.get("order:1001".getBytes())));
+        }
+    }
+}
+```
+
 ---
 
 ## 📈 基准性能表现
