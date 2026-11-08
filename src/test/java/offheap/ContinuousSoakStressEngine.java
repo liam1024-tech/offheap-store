@@ -246,7 +246,8 @@ public class ContinuousSoakStressEngine {
                         }
                     }
 
-                    // 2. 模拟系统崩溃与重挂载 (关闭当前实例，重新在原目录 open)
+                    // 2. 模拟系统崩溃与重挂载 (先置空使工作线程平滑等待，关闭当前实例，重新在原目录 open)
+                    storeRef.set(null);
                     currentStore.sync();
                     currentStore.close();
 

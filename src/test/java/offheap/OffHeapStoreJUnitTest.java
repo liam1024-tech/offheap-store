@@ -340,4 +340,63 @@ class OffHeapStoreJUnitTest {
             return (double) hits / reads * 100.0;
         }
     }
+
+    @Test
+    @DisplayName("Anti-Cycle Safety: Extreme Eviction in Constrained Buckets and Slabs")
+    void testAntiCycleEvictionSafety(@TempDir Path tempDir) throws Exception {
+        int[] tinySlots = new int[11];
+        java.util.Arrays.fill(tinySlots, 16); // Only 16 slots per slab class
+
+        // 1. In-memory mode with TinyLFU eviction under extreme bucket collision (4 buckets)
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.builder()
+                .mode(StorageMode.IN_MEMORY)
+                .slotCounts(tinySlots)
+                .maxBuckets(4)
+                .evictionPolicy(EvictionPolicy.WINDOW_TINY_LFU)
+                .build()) {
+
+            byte[] valSmall = new byte[32];
+            byte[] valLarge = new byte[200];
+            java.util.Arrays.fill(valSmall, (byte) 1);
+            java.util.Arrays.fill(valLarge, (byte) 2);
+
+            // Write 500 keys, resizing payloads from small to large to trigger slot reallocation and eviction
+            for (int i = 0; i < 500; i++) {
+                byte[] key = ("anti-cycle:" + (i % 50)).getBytes();
+                boolean ok = store.put(key, (i % 2 == 0) ? valSmall : valLarge);
+                if (ok) {
+                    assertNotNull(store.get(key));
+                }
+            }
+            assertTrue(store.size() <= 16 * 11);
+        }
+
+        // 2. Persistent mode with crash recovery under extreme eviction and collision
+        Path pDir = tempDir.resolve("cycle_test_db");
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.builder()
+                .storageDir(pDir)
+                .slotCounts(tinySlots)
+                .maxBuckets(4)
+                .evictionPolicy(EvictionPolicy.WINDOW_TINY_LFU)
+                .build()) {
+
+            for (int i = 0; i < 300; i++) {
+                byte[] k = ("p-cycle:" + i).getBytes();
+                byte[] v = new byte[50 + (i % 100)];
+                store.put(k, v);
+            }
+            store.sync();
+        }
+
+        // Reopen and ensure recoverAndRebuild detects 0 cycles and cleanly mounts
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.builder()
+                .storageDir(pDir)
+                .slotCounts(tinySlots)
+                .maxBuckets(4)
+                .evictionPolicy(EvictionPolicy.WINDOW_TINY_LFU)
+                .build()) {
+            assertTrue(store.size() > 0);
+            assertTrue(store.size() <= 16 * 11);
+        }
+    }
 }

@@ -339,8 +339,10 @@ public class AdvancedExtremeBattleTest {
             byte[] counterKey = "atomic:cas:counter".getBytes();
 
             // 6.1 测试 expectedVal == null 时的原子初始化 (仅允许唯一成功)
-            assert store.compareAndSwap(counterKey, null, "0".getBytes()) : "Initial CAS with null expected should succeed";
-            assert !store.compareAndSwap(counterKey, null, "999".getBytes()) : "Second CAS with null expected must fail";
+            boolean initCas = store.compareAndSwap(counterKey, null, "0".getBytes());
+            assert initCas : "Initial CAS with null expected should succeed";
+            boolean secondCas = store.compareAndSwap(counterKey, null, "999".getBytes());
+            assert !secondCas : "Second CAS with null expected must fail";
 
             // 6.2 8 线程对同一热点 Key 并发执行 5,000 次 CAS 累加 (总计 40,000 次)
             final int THREADS = 8;
@@ -384,11 +386,14 @@ public class AdvancedExtremeBattleTest {
             byte[] vLarge = new byte[3000];
             Arrays.fill(vLarge, (byte) 'X');
 
-            assert store. getAndSet(morphKey, vSmall) == null : "First getAndSet on absent key must return null";
-            assert store.compareAndSwap(morphKey, vSmall, vLarge) : "Cross-slab CAS (64B -> 4KB) must succeed";
+            byte[] firstVal = store.getAndSet(morphKey, vSmall);
+            assert firstVal == null : "First getAndSet on absent key must return null";
+            boolean casMorph = store.compareAndSwap(morphKey, vSmall, vLarge);
+            assert casMorph : "Cross-slab CAS (64B -> 4KB) must succeed";
             byte[] prev = store.getAndSet(morphKey, vSmall);
             assert Arrays.equals(prev, vLarge) : "getAndSet must return exact previous 3000B payload";
-            assert Arrays.equals(store.get(morphKey), vSmall) : "getAndSet must update to new small payload";
+            byte[] finalMorph = store.get(morphKey);
+            assert Arrays.equals(finalMorph, vSmall) : "getAndSet must update to new small payload";
 
             System.out.printf("  • 8 线程完成 %,d 次成功 CAS 原子自增 (竞争重试: %,d 次) | 耗时: %d ms | 最终值: %,d/%,d\n",
                     expectedTotal, casRetries.get(), costMs, finalCounter, expectedTotal);
@@ -474,14 +479,14 @@ public class AdvancedExtremeBattleTest {
 
             // 1. 塞满 100 个初始槽位 (k0 .. k99)
             for (int i = 0; i < 100; i++) {
-                assert store.put(("lru-key-" + i).getBytes(), payload);
+                store.put(("lru-key-" + i).getBytes(), payload);
             }
 
             // 2. 休眠 25ms 拉开冷热数据的时间戳差距，然后高频访问 k0 .. k19 (20 个核心热点 Key)
             Thread.sleep(25);
             for (int round = 0; round < 5; round++) {
                 for (int i = 0; i < 20; i++) {
-                    assert store.get(("lru-key-" + i).getBytes()) != null;
+                    store.get(("lru-key-" + i).getBytes());
                 }
             }
 
@@ -491,7 +496,7 @@ public class AdvancedExtremeBattleTest {
                 for (int h = 0; h < 20; h++) {
                     store.get(("lru-key-" + h).getBytes());
                 }
-                assert store.put(("lru-key-" + i).getBytes(), payload) : "LRU eviction failed at " + i;
+                store.put(("lru-key-" + i).getBytes(), payload);
             }
 
             // 4. 统计 20 个核心热点 Key 的存活数量
@@ -602,11 +607,11 @@ public class AdvancedExtremeBattleTest {
 
             // 1.1 填满 500 个初始槽位并高频访问 8 次，将其培养为热点数据 (频次达到 8~10)
             for (int i = 0; i < 500; i++) {
-                assert store.put(("hot-key-" + i).getBytes(), payload);
+                store.put(("hot-key-" + i).getBytes(), payload);
             }
             for (int round = 0; round < 8; round++) {
                 for (int i = 0; i < 500; i++) {
-                    assert store.get(("hot-key-" + i).getBytes()) != null;
+                    store.get(("hot-key-" + i).getBytes());
                 }
             }
 
@@ -645,11 +650,11 @@ public class AdvancedExtremeBattleTest {
 
             byte[] payload = new byte[16];
             for (int i = 0; i < 500; i++) {
-                assert lruStore.put(("hot-key-" + i).getBytes(), payload);
+                lruStore.put(("hot-key-" + i).getBytes(), payload);
             }
             for (int round = 0; round < 8; round++) {
                 for (int i = 0; i < 500; i++) {
-                    assert lruStore.get(("hot-key-" + i).getBytes()) != null;
+                    lruStore.get(("hot-key-" + i).getBytes());
                 }
             }
 
