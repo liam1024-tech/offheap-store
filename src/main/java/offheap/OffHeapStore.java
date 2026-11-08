@@ -362,8 +362,16 @@ public class OffHeapStore implements AutoCloseable {
             if (matchesKey(currHandle, hash, key)) {
                 int oldClass = decodeClassIdx(currHandle);
                 if (oldClass == classIdx) {
-                    // 相同规格，就地覆写更新
+                    // 相同规格，就地覆写更新 (确保句柄携带哈希指纹)
                     writeRecord(currHandle, hash, key, val, ttlMs);
+                    long taggedHandle = encodeHandle(classIdx, decodeSlotIdx(currHandle), hash);
+                    if (taggedHandle != currHandle) {
+                        if (prevHandle == -1L) {
+                            indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, taggedHandle);
+                        } else {
+                            setNextHandle(prevHandle, taggedHandle);
+                        }
+                    }
                     return true;
                 } else {
                     // 规格变更：先尝试为新规格分配槽位 (Failure Atomicity 事务原子性，排除当前桶)
@@ -542,6 +550,14 @@ public class OffHeapStore implements AutoCloseable {
                     int oldClass = decodeClassIdx(currHandle);
                     if (oldClass == newClassIdx) {
                         writeRecord(currHandle, hash, key, newVal, ttlMs);
+                        long taggedHandle = encodeHandle(newClassIdx, decodeSlotIdx(currHandle), hash);
+                        if (taggedHandle != currHandle) {
+                            if (prevHandle == -1L) {
+                                indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, taggedHandle);
+                            } else {
+                                setNextHandle(prevHandle, taggedHandle);
+                            }
+                        }
                         if (frequencySketch != null) {
                             frequencySketch.record(hash);
                         }
@@ -624,6 +640,14 @@ public class OffHeapStore implements AutoCloseable {
                         int oldClass = decodeClassIdx(currHandle);
                         if (oldClass == newClassIdx) {
                             writeRecord(currHandle, hash, key, newVal, ttlMs);
+                            long taggedHandle = encodeHandle(newClassIdx, decodeSlotIdx(currHandle), hash);
+                            if (taggedHandle != currHandle) {
+                                if (prevHandle == -1L) {
+                                    indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, taggedHandle);
+                                } else {
+                                    setNextHandle(prevHandle, taggedHandle);
+                                }
+                            }
                             if (frequencySketch != null) {
                                 frequencySketch.record(hash);
                             }
@@ -863,15 +887,13 @@ public class OffHeapStore implements AutoCloseable {
 
         if (expiredKeys != null) {
             for (byte[] expKey : expiredKeys) {
-                remove(expKey);
+                removeIfExpired(expKey);
             }
         }
 
         return results;
     }
 
-    /**
-     * 原子一致性多键批量读取 (Map 映射模式)：
     /**
      * 原子一致性多键批量读取 (Map 映射模式 - JCache / Caffeine 风格)：
      * 返回内容安全的有序映射 (基于 Arrays::compare 比较器)，确保以 byte[] 为键时内容相同即可定位。
@@ -941,9 +963,9 @@ public class OffHeapStore implements AutoCloseable {
             lock.unlock();
         }
 
-        // 若已过期，升级为写锁执行惰性清理
+        // 若已过期，升级为写锁执行条件惰性清理 (防范并发新写入被误删)
         if (expired) {
-            remove(key);
+            removeIfExpired(key);
             missCount.incrementAndGet();
             return null;
         }
@@ -990,6 +1012,49 @@ public class OffHeapStore implements AutoCloseable {
                     freeHandle(currHandle);
                     entryCount.decrementAndGet();
                     return true;
+                }
+                prevHandle = currHandle;
+                currHandle = getNextHandle(currHandle);
+            }
+            return false;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 条件删除：仅当键仍处于过期状态时才执行物理删除 (防范读锁释放至写锁获取期间的并发覆写竞态)
+     */
+    public boolean removeIfExpired(byte[] key) {
+        checkNotClosed();
+        Objects.requireNonNull(key, "key cannot be null");
+
+        long hash = hash64(key);
+        int bucket = (int) (hash & bucketMask);
+        int stripe = bucket & stripeMask;
+
+        var lock = locks[stripe].writeLock();
+        lock.lock();
+        try {
+            checkNotClosed();
+            long prevHandle = -1L;
+            long currHandle = indexSegment.getAtIndex(ValueLayout.JAVA_LONG, bucket);
+            int steps = 0;
+
+            while (currHandle != -1L && ++steps <= MAX_CHAIN_STEPS) {
+                if (matchesKey(currHandle, hash, key)) {
+                    if (isExpired(currHandle)) {
+                        long nextHandle = getNextHandle(currHandle);
+                        if (prevHandle == -1L) {
+                            indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, nextHandle);
+                        } else {
+                            setNextHandle(prevHandle, nextHandle);
+                        }
+                        freeHandle(currHandle);
+                        entryCount.decrementAndGet();
+                        return true;
+                    }
+                    return false; // 已被并发写入更新为有效值，绝不误删！
                 }
                 prevHandle = currHandle;
                 currHandle = getNextHandle(currHandle);
@@ -1050,6 +1115,7 @@ public class OffHeapStore implements AutoCloseable {
                         slab.freeSlots[s] = s;
                         long base = slab.getOffset(s);
                         slab.segment.set(ValueLayout.JAVA_INT, base + OFF_MAGIC, 0);
+                        slab.segment.set(ValueLayout.JAVA_LONG, base + OFF_NEXT_HANDLE, -1L);
                     }
                     slab.allocatedCount.set(0);
                 }
@@ -1396,6 +1462,11 @@ public class OffHeapStore implements AutoCloseable {
                     int steps = 0;
                     while (curr != -1L && ++steps <= MAX_CHAIN_STEPS) {
                         if (decodeClassIdx(curr) == classIdx && decodeSlotIdx(curr) == victimSlot) {
+                            long vBase = slab.getOffset(victimSlot);
+                            if (seg.get(ValueLayout.JAVA_INT, vBase + OFF_MAGIC) != MAGIC_HEADER
+                                    || seg.get(ValueLayout.JAVA_LONG, vBase + OFF_HASH) != victimHash) {
+                                break; // 采样后该槽位已被并发重分配给其他键，放弃本轮驱逐以保护新键
+                            }
                             long next = getNextHandle(curr);
                             if (prev == -1L) {
                                 indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, next);
@@ -1429,17 +1500,17 @@ public class OffHeapStore implements AutoCloseable {
         MemorySegment seg = slab.segment;
         long now = System.currentTimeMillis();
         int maxProbes = Math.min(cap, 32);
-        int targetSamples = Math.min(8, cap);
+        int targetSamples = Math.min(10, cap);
+        var rng = java.util.concurrent.ThreadLocalRandom.current();
 
         for (int attempt = 0; attempt < 3; attempt++) {
-            int start = java.util.concurrent.ThreadLocalRandom.current().nextInt(cap);
             int bestSlot = -1;
             long oldestAccess = Long.MAX_VALUE;
             long bestHash = 0L;
             int validSampled = 0;
 
             for (int i = 0; i < maxProbes && validSampled < targetSamples; i++) {
-                int slot = (start + i) % cap;
+                int slot = rng.nextInt(cap);
                 long base = slab.getOffset(slot);
                 int magic = seg.get(ValueLayout.JAVA_INT, base + OFF_MAGIC);
                 if (magic != MAGIC_HEADER) continue;
@@ -1479,6 +1550,11 @@ public class OffHeapStore implements AutoCloseable {
                     int steps = 0;
                     while (curr != -1L && ++steps <= MAX_CHAIN_STEPS) {
                         if (decodeClassIdx(curr) == classIdx && decodeSlotIdx(curr) == bestSlot) {
+                            long vBase = slab.getOffset(bestSlot);
+                            if (seg.get(ValueLayout.JAVA_INT, vBase + OFF_MAGIC) != MAGIC_HEADER
+                                    || seg.get(ValueLayout.JAVA_LONG, vBase + OFF_HASH) != bestHash) {
+                                break; // 采样后该槽位已被并发重分配给其他键，放弃本轮驱逐以保护新键
+                            }
                             long next = getNextHandle(curr);
                             if (prev == -1L) {
                                 indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, next);

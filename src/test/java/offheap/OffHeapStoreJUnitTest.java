@@ -399,4 +399,59 @@ class OffHeapStoreJUnitTest {
             assertTrue(store.size() <= 16 * 11);
         }
     }
+
+    @Test
+    @DisplayName("Self-Healing & Race Safety: Cross-Bucket Torn Write Recovery and removeIfExpired")
+    void testCrossBucketTornWriteSelfHealingAndRemoveIfExpired(@TempDir Path tempDir) throws Exception {
+        // 1. Verify OffHeapStore.removeIfExpired does not delete a freshly updated live key
+        try (OffHeapStore memStore = OffHeapStore.inMemory(64)) {
+            byte[] k = "race-key".getBytes();
+            byte[] v1 = "v1-expiring".getBytes();
+            byte[] v2 = "v2-fresh-live".getBytes();
+
+            assertTrue(memStore.put(k, v1, 20L));
+            Thread.sleep(40L);
+            // Simulate concurrent thread overwriting with fresh live value right before removeIfExpired
+            assertTrue(memStore.put(k, v2, 60_000L));
+            assertFalse(memStore.removeIfExpired(k), "removeIfExpired must not delete a newly overwritten non-expired key");
+            assertArrayEquals(v2, memStore.get(k));
+        }
+
+        // 2. Verify PersistentOffHeapStore.recoverAndRebuild prunes cross-bucket torn pointers without corrupting true owner bucket
+        Path dbDir = tempDir.resolve("torn_write_db");
+        byte[] kA = "bucket-owner-key-A".getBytes();
+        byte[] vA = "value-A-intact".getBytes();
+
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.open(dbDir)) {
+            assertTrue(store.put(kA, vA));
+            store.sync();
+        }
+
+        // Inject a simulated cross-bucket torn pointer into index.dat:
+        // Copy the valid handle from its true bucket into a different bucket (trueBucket ^ 1)
+        Path indexFile = dbDir.resolve("index.dat");
+        try (var ch = java.nio.channels.FileChannel.open(indexFile,
+                java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)) {
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.nativeOrder());
+            int trueBucket = (int) (PersistentOffHeapStore.hash64(kA) & (65536 - 1));
+            int wrongBucket = trueBucket ^ 1;
+
+            ch.read(buf, (long) trueBucket * 8L);
+            buf.flip();
+            long handle = buf.getLong();
+            assertNotEquals(-1L, handle);
+
+            buf.clear();
+            buf.putLong(handle);
+            buf.flip();
+            ch.write(buf, (long) wrongBucket * 8L);
+            ch.force(true);
+        }
+
+        // Reopen store: recoverAndRebuild must prune the wrongBucket link while keeping kA 100% intact in trueBucket
+        try (PersistentOffHeapStore reopened = PersistentOffHeapStore.open(dbDir)) {
+            assertEquals(1L, reopened.size());
+            assertArrayEquals(vA, reopened.get(kA));
+        }
+    }
 }

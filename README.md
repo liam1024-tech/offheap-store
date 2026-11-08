@@ -105,7 +105,7 @@ Add the JVM flag `--enable-native-access=ALL-UNNAMED` to allow Java FFM access w
     <dependency>
         <groupId>io.github.liam1024-tech</groupId>
         <artifactId>offheap-store</artifactId>
-        <version>1.2.1</version>
+        <version>1.2.3</version>
     </dependency>
 </dependencies>
 ```

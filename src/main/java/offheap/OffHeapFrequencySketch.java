@@ -6,6 +6,7 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -32,6 +33,7 @@ public final class OffHeapFrequencySketch implements AutoCloseable {
     private final int tableLongs;
     private final int sampleSize;
     private final AtomicInteger additions = new AtomicInteger();
+    private final AtomicBoolean resetting = new AtomicBoolean(false);
 
     /**
      * 创建纯堆外频率草图
@@ -126,22 +128,34 @@ public final class OffHeapFrequencySketch implements AutoCloseable {
 
     /**
      * 周期性频次衰减 (Halving / Aging)：
-     * 一次性将全部计数器值减半，防止历史古老数据永久霸占热点
+     * 采用无阻塞 CAS 抢占，仅由单个胜出线程执行全表减半，其余并发读写线程零阻塞继续运行
      */
-    synchronized void tryReset() {
+    void tryReset() {
         if (additions.get() < sampleSize) {
             return;
         }
-        reset();
+        if (resetting.compareAndSet(false, true)) {
+            try {
+                if (additions.get() >= sampleSize) {
+                    reset();
+                }
+            } finally {
+                resetting.set(false);
+            }
+        }
     }
 
     synchronized void reset() {
-        // 单周期 SIMD 级机器字批量除以 2
+        // 单周期 SIMD 级机器字批量除以 2 (CAS 无锁协调防并发覆盖)
         for (int w = 0; w < tableLongs; w++) {
             long wordOffset = (long) w * 8L;
-            long currentWord = (long) LONG_HANDLE.getVolatile(segment, wordOffset);
-            long halved = (currentWord >>> 1) & RESET_MASK;
-            LONG_HANDLE.setVolatile(segment, wordOffset, halved);
+            while (true) {
+                long currentWord = (long) LONG_HANDLE.getVolatile(segment, wordOffset);
+                long halved = (currentWord >>> 1) & RESET_MASK;
+                if (LONG_HANDLE.compareAndSet(segment, wordOffset, currentWord, halved)) {
+                    break;
+                }
+            }
         }
         additions.set(sampleSize >>> 1);
     }

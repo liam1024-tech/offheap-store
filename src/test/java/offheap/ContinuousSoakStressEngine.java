@@ -15,6 +15,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
  * 7天连续不间断极端高压混沌测试与自愈引擎 (Continuous Soak & Chaos Stress Engine)
@@ -111,8 +112,12 @@ public class ContinuousSoakStressEngine {
         AtomicLong totalRestarts = new AtomicLong(0);
         AtomicLong anomaliesDetected = new AtomicLong(0);
 
-        // 延迟采样直方图 (纳秒)
-        ConcurrentLinkedQueue<Long> latencies = new ConcurrentLinkedQueue<>();
+        // 零堆分配环形延迟采样缓冲 (4096 槽位，O(1) 无锁写入，彻底消除 ConcurrentLinkedQueue.size() 的 O(N) 遍历与装箱开销)
+        final int latencyRingSize = 4096;
+        final int latencyRingMask = latencyRingSize - 1;
+        AtomicLongArray latencyRing = new AtomicLongArray(latencyRingSize);
+        AtomicInteger latencyCursor = new AtomicInteger(0);
+        long[] sortBuffer = new long[latencyRingSize];
 
         // 共享 KeySpace (制造真实的高频锁争用与哈希碰撞)
         byte[][] keyPool = new byte[keySpace][];
@@ -195,9 +200,9 @@ public class ContinuousSoakStressEngine {
                         }
 
                         long elapsedNs = System.nanoTime() - t0;
-                        if (totalOps.incrementAndGet() % 100 == 0) {
-                            latencies.offer(elapsedNs);
-                            if (latencies.size() > 5000) latencies.poll();
+                        if ((totalOps.incrementAndGet() & 127L) == 0L) {
+                            int slot = latencyCursor.getAndIncrement() & latencyRingMask;
+                            latencyRing.lazySet(slot, elapsedNs);
                         }
                     } catch (IllegalStateException e) {
                         if (e.getMessage() != null && (e.getMessage().toLowerCase().contains("already closed") || e.getMessage().contains("already been closed"))) {
@@ -339,12 +344,18 @@ public class ContinuousSoakStressEngine {
                 lastOps = currentOps;
                 lastTimeNs = nowNs;
 
-                // 计算延迟分位数 (微秒)
-                List<Long> latList = new ArrayList<>(latencies);
-                Collections.sort(latList);
-                double p50 = latList.isEmpty() ? 0 : latList.get((int) (latList.size() * 0.50)) / 1000.0;
-                double p99 = latList.isEmpty() ? 0 : latList.get((int) (latList.size() * 0.99)) / 1000.0;
-                double p999 = latList.isEmpty() ? 0 : latList.get((int) (latList.size() * 0.999)) / 1000.0;
+                // 计算延迟分位数 (微秒，0 对象分配原语排序)
+                int validLatCount = 0;
+                for (int i = 0; i < latencyRingSize; i++) {
+                    long v = latencyRing.get(i);
+                    if (v > 0L) {
+                        sortBuffer[validLatCount++] = v;
+                    }
+                }
+                Arrays.sort(sortBuffer, 0, validLatCount);
+                double p50 = validLatCount == 0 ? 0 : sortBuffer[(int) (validLatCount * 0.50)] / 1000.0;
+                double p99 = validLatCount == 0 ? 0 : sortBuffer[(int) (validLatCount * 0.99)] / 1000.0;
+                double p999 = validLatCount == 0 ? 0 : sortBuffer[(int) (validLatCount * 0.999)] / 1000.0;
 
                 long currentGcTime = 0;
                 for (var b : gcBeans) currentGcTime += b.getCollectionTime();

@@ -112,10 +112,12 @@ public class PersistentOffHeapStore implements AutoCloseable {
     private final Arena arena;
     private volatile boolean closed = false;
 
-    // 超级块元数据段
+    // 超级块元数据段与底层文件通道
+    private final FileChannel metaChannel;
     private final MemorySegment metaSegment;
 
-    // 哈希索引表
+    // 哈希索引表与底层文件通道
+    private final FileChannel indexChannel;
     private final MemorySegment indexSegment;
     private final int bucketCount;
     private final int bucketMask;
@@ -344,7 +346,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
             // 纯内存模式
             this.bucketCount = nextPowerOfTwo(Math.max(64, maxBuckets));
             this.bucketMask = this.bucketCount - 1;
+            this.metaChannel = null;
             this.metaSegment = null;
+            this.indexChannel = null;
             this.indexSegment = arena.allocate((long) bucketCount * 8, 8);
             for (int i = 0; i < bucketCount; i++) {
                 this.indexSegment.setAtIndex(ValueLayout.JAVA_LONG, i, -1L);
@@ -366,9 +370,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
             boolean isNewStore = !Files.exists(metaFile);
 
             // 1. 映射超级块 (meta.dat)
-            FileChannel metaChan = FileChannel.open(metaFile,
+            this.metaChannel = FileChannel.open(metaFile,
                     StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
-            this.metaSegment = metaChan.map(FileChannel.MapMode.READ_WRITE, 0, META_FILE_SIZE, arena);
+            this.metaSegment = metaChannel.map(FileChannel.MapMode.READ_WRITE, 0, META_FILE_SIZE, arena);
 
             int effectiveBuckets;
             int[] effectiveSlotCounts = new int[SLAB_CLASSES.length];
@@ -408,9 +412,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
             Path indexFile = storageDir.resolve("index.dat");
             boolean isNewIndex = !Files.exists(indexFile);
             long indexBytes = (long) bucketCount * 8;
-            FileChannel indexChan = FileChannel.open(indexFile,
+            this.indexChannel = FileChannel.open(indexFile,
                     StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
-            this.indexSegment = indexChan.map(FileChannel.MapMode.READ_WRITE, 0, indexBytes, arena);
+            this.indexSegment = indexChannel.map(FileChannel.MapMode.READ_WRITE, 0, indexBytes, arena);
             if (isNewIndex) {
                 for (int i = 0; i < bucketCount; i++) {
                     indexSegment.setAtIndex(ValueLayout.JAVA_LONG, i, -1L);
@@ -496,13 +500,13 @@ public class PersistentOffHeapStore implements AutoCloseable {
         int corruptedPruned = 0;
         int orphanedReclaimed = 0;
 
-        // 阶段 1: 初始化可达槽位位图 (用于对账与循环链表防御)
+        // 阶段 1: 初始化可达槽位位图 (用于对账、成环与跨桶共享防御)
         BitSet[] reachable = new BitSet[slabs.length];
         for (int i = 0; i < slabs.length; i++) {
             reachable[i] = new BitSet(slabs[i].capacity);
         }
 
-        // 阶段 2: 扫描哈希桶链路，校验数据完整性 (CRC32/TTL/边界/成环检测) 并自动升级内联哈希指纹
+        // 阶段 2: 扫描哈希桶链路，校验数据完整性 (CRC32/TTL/边界/归属桶/指纹/成环检测) 并自动升级内联哈希指纹
         for (int b = 0; b < bucketCount; b++) {
             long prevHandle = -1L;
             long currHandle = indexSegment.getAtIndex(ValueLayout.JAVA_LONG, b);
@@ -513,61 +517,90 @@ public class PersistentOffHeapStore implements AutoCloseable {
                 int sIdx = decodeSlotIdx(currHandle);
 
                 boolean inBounds = (cIdx >= 0 && cIdx < slabs.length && sIdx >= 0 && sIdx < slabs[cIdx].capacity);
-                long nextHandle = inBounds ? getNextHandle(currHandle) : -1L;
+                if (!inBounds || reachable[cIdx].get(sIdx)) {
+                    // 越界、成环或跨桶重复引用：立即截断当前桶尾链，严禁跨桶窃取或破坏已可达槽位！
+                    if (prevHandle == -1L) {
+                        indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, -1L);
+                    } else {
+                        setNextHandle(prevHandle, -1L);
+                    }
+                    corruptedPruned++;
+                    currHandle = -1L;
+                    break;
+                }
 
+                MemorySegment seg = slabs[cIdx].segment;
+                long base = slabs[cIdx].getOffset(sIdx);
+                int magic = seg.get(ValueLayout.JAVA_INT, base + OFF_MAGIC);
+                long slotHash = seg.get(ValueLayout.JAVA_LONG, base + OFF_HASH);
+                int actualBucket = (int) (slotHash & bucketMask);
+                boolean bucketAndFpMatch = (actualBucket == b) && matchesFingerprint(currHandle, slotHash);
+
+                if (!bucketAndFpMatch) {
+                    // 槽位实际归属桶或内联指纹与当前桶不匹配 (断电未决写入导致槽位已被重分配给其他桶)：
+                    // 绝不可沿用其 nextHandle (属于其他桶的链路)，亦不在本桶清零其 MAGIC (可能正被实际归属桶合法持有)；
+                    // 直接安全截断当前桶链路，若该槽位确实无主，阶段 3 全局对账会自动回收并清零！
+                    if (prevHandle == -1L) {
+                        indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, -1L);
+                    } else {
+                        setNextHandle(prevHandle, -1L);
+                    }
+                    corruptedPruned++;
+                    currHandle = -1L;
+                    break;
+                }
+
+                long nextHandle = getNextHandle(currHandle);
                 boolean valid = false;
                 long upgradedHandle = currHandle;
-                if (inBounds) {
-                    // 成环检测 (防范磁盘损坏或位翻转导致的循环链表)
-                    if (reachable[cIdx].get(sIdx)) {
-                        valid = false; // 发现环，强制阻断！
+
+                if (magic == MAGIC_HEADER) {
+                    long expireAt = seg.get(ValueLayout.JAVA_LONG, base + OFF_EXPIRE_AT);
+                    if (expireAt > 0 && now > expireAt) {
+                        // 停机期间已过期
+                        seg.set(ValueLayout.JAVA_INT, base + OFF_MAGIC, 0);
+                        seg.set(ValueLayout.JAVA_LONG, base + OFF_NEXT_HANDLE, -1L);
+                        expiredCleaned++;
                     } else {
-                        MemorySegment seg = slabs[cIdx].segment;
-                        long base = slabs[cIdx].getOffset(sIdx);
-                        int magic = seg.get(ValueLayout.JAVA_INT, base + OFF_MAGIC);
+                        int keyLen = seg.get(ValueLayout.JAVA_INT, base + OFF_KEY_LEN);
+                        int valLen = seg.get(ValueLayout.JAVA_INT, base + OFF_VAL_LEN);
+                        long needed = HEADER_SIZE + keyLen + valLen + CRC_FOOTER_SIZE;
 
-                        if (magic == MAGIC_HEADER) {
-                            long expireAt = seg.get(ValueLayout.JAVA_LONG, base + OFF_EXPIRE_AT);
-                            if (expireAt > 0 && now > expireAt) {
-                                // 停机期间已过期
+                        if (keyLen <= 0 || valLen < 0 || needed > slabs[cIdx].slotSize) {
+                            seg.set(ValueLayout.JAVA_INT, base + OFF_MAGIC, 0);
+                            seg.set(ValueLayout.JAVA_LONG, base + OFF_NEXT_HANDLE, -1L);
+                            corruptedPruned++;
+                        } else {
+                            int expectedCrc = seg.get(ValueLayout.JAVA_INT_UNALIGNED, base + HEADER_SIZE + keyLen + valLen);
+                            CRC32 crc = CRC_HOLDER.get();
+                            crc.reset();
+                            long keyOffset = base + HEADER_SIZE;
+                            int totalPayload = keyLen + valLen;
+                            byte[] scratch = SCRATCH_HOLDER.get();
+                            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, keyOffset, scratch, 0, totalPayload);
+                            crc.update(scratch, 0, totalPayload);
+
+                            if ((int) crc.getValue() != expectedCrc) {
                                 seg.set(ValueLayout.JAVA_INT, base + OFF_MAGIC, 0);
-                                expiredCleaned++;
+                                seg.set(ValueLayout.JAVA_LONG, base + OFF_NEXT_HANDLE, -1L);
+                                corruptedPruned++;
                             } else {
-                                int keyLen = seg.get(ValueLayout.JAVA_INT, base + OFF_KEY_LEN);
-                                int valLen = seg.get(ValueLayout.JAVA_INT, base + OFF_VAL_LEN);
-                                long needed = HEADER_SIZE + keyLen + valLen + CRC_FOOTER_SIZE;
-
-                                if (keyLen <= 0 || valLen < 0 || needed > slabs[cIdx].slotSize) {
-                                    seg.set(ValueLayout.JAVA_INT, base + OFF_MAGIC, 0);
-                                    corruptedPruned++;
-                                } else {
-                                    int expectedCrc = seg.get(ValueLayout.JAVA_INT_UNALIGNED, base + HEADER_SIZE + keyLen + valLen);
-                                    CRC32 crc = CRC_HOLDER.get();
-                                    crc.reset();
-                                    long keyOffset = base + HEADER_SIZE;
-                                    int totalPayload = keyLen + valLen;
-                                    byte[] scratch = SCRATCH_HOLDER.get();
-                                    MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, keyOffset, scratch, 0, totalPayload);
-                                    crc.update(scratch, 0, totalPayload);
-
-                                    if ((int) crc.getValue() != expectedCrc) {
-                                        seg.set(ValueLayout.JAVA_INT, base + OFF_MAGIC, 0);
-                                        corruptedPruned++;
-                                    } else {
-                                        valid = true;
-                                        reachable[cIdx].set(sIdx);
-                                        seg.set(ValueLayout.JAVA_LONG, base + OFF_LAST_ACCESS, System.nanoTime());
-                                        long slotHash = seg.get(ValueLayout.JAVA_LONG, base + OFF_HASH);
-                                        upgradedHandle = encodeHandle(cIdx, sIdx, slotHash);
-                                    }
+                                valid = true;
+                                reachable[cIdx].set(sIdx);
+                                long lastAccess = seg.get(ValueLayout.JAVA_LONG, base + OFF_LAST_ACCESS);
+                                if (lastAccess <= 0L || lastAccess > now) {
+                                    seg.set(ValueLayout.JAVA_LONG, base + OFF_LAST_ACCESS, now);
                                 }
+                                upgradedHandle = encodeHandle(cIdx, sIdx, slotHash);
                             }
                         }
                     }
+                } else {
+                    corruptedPruned++;
                 }
 
                 if (!valid) {
-                    // 解除脏/过期/损坏/成环引用
+                    // 解除本桶内的过期或损坏节点，保留后续本桶链表
                     if (prevHandle == -1L) {
                         indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, nextHandle);
                     } else {
@@ -585,6 +618,15 @@ public class PersistentOffHeapStore implements AutoCloseable {
                     prevHandle = upgradedHandle;
                 }
                 currHandle = nextHandle;
+            }
+
+            if (currHandle != -1L) {
+                // 超出 MAX_CHAIN_STEPS 防线，强制截断残余尾链
+                if (prevHandle == -1L) {
+                    indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, -1L);
+                } else {
+                    setNextHandle(prevHandle, -1L);
+                }
             }
         }
 
@@ -905,6 +947,14 @@ public class PersistentOffHeapStore implements AutoCloseable {
                     int oldClass = decodeClassIdx(currHandle);
                     if (oldClass == newClassIdx) {
                         writeRecord(currHandle, hash, key, newVal, ttlMs);
+                        long taggedHandle = encodeHandle(newClassIdx, decodeSlotIdx(currHandle), hash);
+                        if (taggedHandle != currHandle) {
+                            if (prevHandle == -1L) {
+                                indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, taggedHandle);
+                            } else {
+                                setNextHandle(prevHandle, taggedHandle);
+                            }
+                        }
                         swapped = true;
                         return true;
                     } else {
@@ -995,6 +1045,14 @@ public class PersistentOffHeapStore implements AutoCloseable {
                         int oldClass = decodeClassIdx(currHandle);
                         if (oldClass == newClassIdx) {
                             writeRecord(currHandle, hash, key, newVal, ttlMs);
+                            long taggedHandle = encodeHandle(newClassIdx, decodeSlotIdx(currHandle), hash);
+                            if (taggedHandle != currHandle) {
+                                if (prevHandle == -1L) {
+                                    indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, taggedHandle);
+                                } else {
+                                    setNextHandle(prevHandle, taggedHandle);
+                                }
+                            }
                             mutated = true;
                             return oldVal;
                         } else {
@@ -1256,9 +1314,6 @@ public class PersistentOffHeapStore implements AutoCloseable {
     }
 
     /**
-     * 原子一致性多键批量读取 (Map 映射模式)：
-     * 返回内容安全的有序映射 (基于 Arrays::compare 比较器)，确保以 byte[] 为键时内容相同即可定位。
-    /**
      * 原子一致性多键批量读取 (Map 映射模式 - JCache / Caffeine 风格)：
      * 返回内容安全的有序映射 (基于 Arrays::compare 比较器)，确保以 byte[] 为键时内容相同即可定位。
      *
@@ -1426,6 +1481,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
         long hash = hash64(key);
         int bucket = (int) (hash & bucketMask);
         int stripe = bucket & stripeMask;
+        boolean removed = false;
 
         var lock = locks[stripe].writeLock();
         lock.lock();
@@ -1446,6 +1502,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
                         }
                         freeHandle(currHandle);
                         entryCount.decrementAndGet();
+                        removed = true;
                         return true;
                     }
                     return false; // 已被并发写入更新为有效值，绝不误删！
@@ -1456,6 +1513,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
             return false;
         } finally {
             lock.unlock();
+            if (removed) {
+                onMutationCompleted();
+            }
         }
     }
 
@@ -1503,6 +1563,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
                         slab.freeSlots[s] = s;
                         long base = slab.getOffset(s);
                         slab.segment.set(ValueLayout.JAVA_INT, base + OFF_MAGIC, 0);
+                        slab.segment.set(ValueLayout.JAVA_LONG, base + OFF_NEXT_HANDLE, -1L);
                     }
                     slab.allocatedCount.set(0);
                 }
@@ -1886,6 +1947,11 @@ public class PersistentOffHeapStore implements AutoCloseable {
                     int steps = 0;
                     while (curr != -1L && ++steps <= MAX_CHAIN_STEPS) {
                         if (decodeClassIdx(curr) == classIdx && decodeSlotIdx(curr) == victimSlot) {
+                            long vBase = slab.getOffset(victimSlot);
+                            if (seg.get(ValueLayout.JAVA_INT, vBase + OFF_MAGIC) != MAGIC_HEADER
+                                    || seg.get(ValueLayout.JAVA_LONG, vBase + OFF_HASH) != victimHash) {
+                                break; // 采样后该槽位已被并发重分配给其他键，放弃本轮驱逐以保护新键
+                            }
                             long next = getNextHandle(curr);
                             if (prev == -1L) {
                                 indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, next);
@@ -1910,7 +1976,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
 
     /**
      * Redis 式 K-Sample 随机采样 O(1) 近似 LRU 淘汰 (0 堆内存分配，无死锁)：
-     * 1. 在目标 Slab 中随机抽样 K=8 个有效占用槽位，比较其 OFF_LAST_ACCESS 时间戳；
+     * 1. 在目标 Slab 中随机抽样 K=10 个有效占用槽位，比较其 OFF_LAST_ACCESS 时间戳；
      * 2. 优先淘汰已过期槽位，否则精准选中 K 个样本中最久未访问 (最小 lastAccess) 的槽位；
      * 3. 直接读取槽头 OFF_HASH 定位哈希桶并通过 (classIdx, slotIdx) 解链，全程 0 byte[] 堆分配！
      */
@@ -1973,6 +2039,11 @@ public class PersistentOffHeapStore implements AutoCloseable {
                     int steps = 0;
                     while (curr != -1L && ++steps <= MAX_CHAIN_STEPS) {
                         if (decodeClassIdx(curr) == classIdx && decodeSlotIdx(curr) == bestSlot) {
+                            long vBase = slab.getOffset(bestSlot);
+                            if (seg.get(ValueLayout.JAVA_INT, vBase + OFF_MAGIC) != MAGIC_HEADER
+                                    || seg.get(ValueLayout.JAVA_LONG, vBase + OFF_HASH) != bestHash) {
+                                break; // 采样后该槽位已被并发重分配给其他键，放弃本轮驱逐以保护新键
+                            }
                             long next = getNextHandle(curr);
                             if (prev == -1L) {
                                 indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, next);
@@ -2104,6 +2175,15 @@ public class PersistentOffHeapStore implements AutoCloseable {
         }
     }
 
+    private static void closeQuietly(Closeable c) {
+        if (c != null) {
+            try {
+                c.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
     @Override
     public synchronized void close() {
         if (!closed) {
@@ -2130,6 +2210,15 @@ public class PersistentOffHeapStore implements AutoCloseable {
                 }
             }
             arena.close();
+            if (slabs != null) {
+                for (SlabClass slab : slabs) {
+                    if (slab != null) {
+                        closeQuietly(slab.fileChannel);
+                    }
+                }
+            }
+            closeQuietly(indexChannel);
+            closeQuietly(metaChannel);
         }
     }
 }
