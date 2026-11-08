@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -83,6 +84,47 @@ class OffHeapStoreJUnitTest {
             for (Map.Entry<byte[], byte[]> entry : batch.entrySet()) {
                 assertArrayEquals(entry.getValue(), store.get(entry.getKey()));
             }
+        }
+    }
+
+    @Test
+    @DisplayName("Atomic Consistent BatchGet (List & Map modes)")
+    void testBatchGet() {
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.inMemory()) {
+            byte[] k1 = "batch:get:1".getBytes();
+            byte[] v1 = "val1".getBytes();
+            byte[] k2 = "batch:get:2".getBytes();
+            byte[] v2 = "val2".getBytes();
+            byte[] k3 = "batch:get:3".getBytes();
+            byte[] v3 = "val3".getBytes();
+            byte[] kMissing = "batch:missing".getBytes();
+
+            store.put(k1, v1);
+            store.put(k2, v2);
+            store.put(k3, v3);
+
+            // 1. Test List mode (Redis MGET order-preserving)
+            List<byte[]> keys = List.of(k1, kMissing, k3, k2);
+            List<byte[]> vals = store.batchGet(keys);
+            assertEquals(4, vals.size());
+            assertArrayEquals(v1, vals.get(0));
+            assertNull(vals.get(1));
+            assertArrayEquals(v3, vals.get(2));
+            assertArrayEquals(v2, vals.get(3));
+
+            // 2. Test Map mode (content-safe Map via getAll & batchGetMap)
+            Map<byte[], byte[]> map = store.getAll(List.of(k1, kMissing, k2));
+            assertEquals(2, map.size());
+            assertArrayEquals(v1, map.get(k1));
+            assertArrayEquals(v2, map.get(k2));
+            assertNull(map.get(kMissing));
+
+            Map<byte[], byte[]> map2 = store.batchGetMap(List.of(k1, k2));
+            assertEquals(2, map2.size());
+
+            // 3. Test empty collection
+            assertTrue(store.batchGet(List.of()).isEmpty());
+            assertTrue(store.getAll(List.of()).isEmpty());
         }
     }
 
