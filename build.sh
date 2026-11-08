@@ -16,7 +16,8 @@ echo "=== Using Runtime:  $($JAVA -version 2>&1 | head -n 1) ==="
 
 TARGET_CLASSES="target/classes"
 TARGET_TEST_CLASSES="target/test-classes"
-TARGET_JAR="target/offheap-store-1.0.0.jar"
+VERSION=$(grep -m1 '<version>' pom.xml | sed 's/[^0-9.]//g')
+TARGET_JAR="target/offheap-store-${VERSION}.jar"
 
 mkdir -p "$TARGET_CLASSES" "$TARGET_TEST_CLASSES"
 
