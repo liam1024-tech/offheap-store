@@ -17,7 +17,7 @@ public class PersistentRecoveryTest {
         System.out.println("   🛡️  PersistentOffHeapStore 磁盘 MMAP 持久化与服务重启自愈实测 🛡️");
         System.out.println("================================================================================");
 
-        Path testDir = Path.of("/home/antigravity/test_persistent_data");
+        Path testDir = Path.of(System.getProperty("java.io.tmpdir"), "offheap_test_persistent_data");
         // 清理旧目录
         if (Files.exists(testDir)) {
             Files.walk(testDir)

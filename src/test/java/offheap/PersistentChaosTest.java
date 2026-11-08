@@ -27,7 +27,7 @@ import java.util.zip.CRC32;
  */
 public class PersistentChaosTest {
 
-    private static final Path CHAOS_DIR = Path.of("/home/antigravity/chaos_test_data");
+    private static final Path CHAOS_DIR = Path.of(System.getProperty("java.io.tmpdir"), "offheap_chaos_test_data");
 
     public static void main(String[] args) throws Exception {
         System.out.println("================================================================================");

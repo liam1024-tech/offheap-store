@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class PersistentConcurrencyRaceTest {
 
-    private static final Path TEST_DIR = Path.of("/home/antigravity/race_test_data");
+    private static final Path TEST_DIR = Path.of(System.getProperty("java.io.tmpdir"), "offheap_race_test_data");
 
     public static void main(String[] args) throws Exception {
         System.out.println("================================================================================");
