@@ -31,10 +31,13 @@ jobs:
     - name: Build and Package
       run: ./build.sh
 
-    - name: Run 9 Extreme Battle Tests
+    - name: Run 10 Extreme Battle Tests
       run: |
         java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest
 
     - name: Run Dual-Mode Verification
       run: |
         java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.DualModeStorageTest
+
+    - name: Run Maven JUnit Tests
+      run: mvn test
