@@ -179,6 +179,46 @@ public class ExampleInMemory {
 }
 ```
 
+### C. High-Performance Batch Operations (Deadlock-Free BatchPut & Consistent BatchGet / GetAll)
+
+```java
+import offheap.PersistentOffHeapStore;
+import java.util.List;
+import java.util.Map;
+
+public class ExampleBatchOperations {
+    public static void main(String[] args) {
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.inMemory()) {
+            
+            // 1. Deadlock-Free Atomic Batch Write (Bitmask Ascending Stripe Locks)
+            Map<byte[], byte[]> batch = Map.of(
+                "order:1001".getBytes(), "status:paid".getBytes(),
+                "order:1002".getBytes(), "status:pending".getBytes(),
+                "order:1003".getBytes(), "status:shipped".getBytes()
+            );
+            int written = store.batchPut(batch, 60_000L); // with 60s TTL
+            System.out.println("Batch Put Count: " + written);
+
+            // 2. Redis MGET-style Positional Batch Read (Preserves 1:1 List order, null for missing/expired)
+            List<byte[]> queryKeys = List.of(
+                "order:1001".getBytes(),
+                "order:9999".getBytes(), // non-existent key
+                "order:1003".getBytes()
+            );
+            List<byte[]> values = store.batchGet(queryKeys);
+            System.out.println("order:1001 -> " + new String(values.get(0)));
+            System.out.println("order:9999 -> " + values.get(1)); // null
+            System.out.println("order:1003 -> " + new String(values.get(2)));
+
+            // 3. Caffeine / JCache-style Map Batch Read (Content-safe Map based on Arrays::compare)
+            Map<byte[], byte[]> hitMap = store.getAll(queryKeys); // or store.batchGetMap(queryKeys)
+            System.out.println("Hits in Map: " + hitMap.size()); // 2 hits
+            System.out.println("Direct byte[] lookup: " + new String(hitMap.get("order:1001".getBytes())));
+        }
+    }
+}
+```
+
 ---
 
 ## 📊 Benchmark & Performance
