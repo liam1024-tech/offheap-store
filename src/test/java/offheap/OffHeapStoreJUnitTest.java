@@ -237,6 +237,65 @@ class OffHeapStoreJUnitTest {
                 String.format("Window TinyLFU hit rate (%.2f%%) must outperform LRU (%.2f%%)", tinyLfuHitRate, lruHitRate));
     }
 
+    @Test
+    @DisplayName("OffHeapStore: TinyLFU Eviction Policy & Admission Gate in Pure In-Memory Wrapper")
+    void testOffHeapStoreWindowTinyLfuEviction() {
+        try (OffHeapStore store = new OffHeapStore(128, 50)) {
+            store.setEvictionPolicy(EvictionPolicy.WINDOW_TINY_LFU);
+            assertEquals(EvictionPolicy.WINDOW_TINY_LFU, store.getEvictionPolicy());
+            assertNotNull(store.getFrequencySketch());
+
+            byte[] payload = new byte[16];
+
+            // 1. Fill 50 slots and access hot keys
+            for (int i = 0; i < 50; i++) {
+                assertTrue(store.put(("mem:hot:" + i).getBytes(), payload));
+            }
+            for (int r = 0; r < 5; r++) {
+                for (int i = 0; i < 50; i++) {
+                    assertNotNull(store.get(("mem:hot:" + i).getBytes()));
+                }
+            }
+
+            // 2. Perform 2,000 cold scans
+            for (int i = 0; i < 2_000; i++) {
+                store.put(("mem:cold:scan:" + i).getBytes(), payload);
+            }
+
+            // 3. Verify hot keys survived against cold scans
+            int survived = 0;
+            for (int i = 0; i < 50; i++) {
+                if (store.containsKey(("mem:hot:" + i).getBytes())) {
+                    survived++;
+                }
+            }
+            assertTrue(survived >= 45, "OffHeapStore TinyLFU must protect hot keys! Survived: " + survived + "/50");
+            assertTrue(store.getAdmissionRejections() > 0, "Admission gate must record rejected cold candidates");
+            assertEquals(store.getAdmissionRejections(), store.getStats().admissionRejections());
+        }
+    }
+
+    @Test
+    @DisplayName("Stats: Accurate Real-time Cache Hit Rate and Metric Calculations")
+    void testStatsHitRateAndMetricCalculations() {
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.inMemory()) {
+            byte[] k1 = "stat:k1".getBytes();
+            byte[] v1 = "val1".getBytes();
+            store.put(k1, v1);
+
+            // 3 hits, 1 miss -> 75% hit rate
+            store.get(k1);
+            store.get(k1);
+            store.get(k1);
+            store.get("stat:non_existent".getBytes());
+
+            PersistentOffHeapStore.Stats stats = store.getStats();
+            assertEquals(3, stats.hits());
+            assertEquals(1, stats.misses());
+            assertEquals(75.0, stats.hitRate(), 0.001, "Hit rate must be precisely 75.0%");
+        }
+    }
+
     private double runBenchmarkWorkload(EvictionPolicy policy, int capacity, int distinctKeys, int ops, byte[] payload) throws Exception {
         int[] slotCounts = new int[11];
         java.util.Arrays.fill(slotCounts, capacity);

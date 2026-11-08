@@ -84,6 +84,7 @@ public class OffHeapStore implements AutoCloseable {
     private final AtomicLong hitCount = new AtomicLong(0);
     private final AtomicLong missCount = new AtomicLong(0);
     private final AtomicLong evictionCount = new AtomicLong(0);
+    private final AtomicLong admissionRejectionCount = new AtomicLong(0);
     private final AtomicLong fingerprintSkips = new AtomicLong(0);
 
     // 线程局部复用 CRC32 实例与校验缓冲，确保极端高频读写路径下 0 额外堆内存分配
@@ -1407,10 +1408,12 @@ public class OffHeapStore implements AutoCloseable {
                     // 若牺牲者是已建立频次的热点数据 (victimFreq >= 2)，而候选者频次较低：
                     // 严格拦截，保护热点免遭全表扫描污染！
                     if (victimFreq >= 2) {
+                        admissionRejectionCount.incrementAndGet();
                         return false;
                     }
                     // 若牺牲者本身也只是冷数据 (victimFreq <= 1)，提供 10% 准入置换概率给全新热点孵化
                     if (rng.nextInt(10) != 0) {
+                        admissionRejectionCount.incrementAndGet();
                         return false;
                     }
                 }
@@ -1578,8 +1581,13 @@ public class OffHeapStore implements AutoCloseable {
             long hits,
             long misses,
             long evictions,
+            long admissionRejections,
             double hitRate
-    ) {}
+    ) {
+        public Stats(long totalCapacityBytes, long allocatedBytes, long activeEntries, long hits, long misses, long evictions, double hitRate) {
+            this(totalCapacityBytes, allocatedBytes, activeEntries, hits, misses, evictions, 0L, hitRate);
+        }
+    }
 
     public record SlabStat(
             int classIdx,
@@ -1604,6 +1612,10 @@ public class OffHeapStore implements AutoCloseable {
         return array;
     }
 
+    public long getAdmissionRejections() {
+        return admissionRejectionCount.get();
+    }
+
     public Stats getStats() {
         long totalCapacity = 0;
         long allocated = 0;
@@ -1614,7 +1626,7 @@ public class OffHeapStore implements AutoCloseable {
         long h = hitCount.get();
         long m = missCount.get();
         double hr = (h + m == 0) ? 0.0 : ((double) h / (h + m)) * 100.0;
-        return new Stats(totalCapacity, allocated, entryCount.get(), h, m, evictionCount.get(), hr);
+        return new Stats(totalCapacity, allocated, entryCount.get(), h, m, evictionCount.get(), admissionRejectionCount.get(), hr);
     }
 
     private void checkNotClosed() {
