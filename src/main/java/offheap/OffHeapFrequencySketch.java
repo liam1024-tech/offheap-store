@@ -128,11 +128,14 @@ public final class OffHeapFrequencySketch implements AutoCloseable {
      * 周期性频次衰减 (Halving / Aging)：
      * 一次性将全部计数器值减半，防止历史古老数据永久霸占热点
      */
-    private synchronized void tryReset() {
+    synchronized void tryReset() {
         if (additions.get() < sampleSize) {
             return;
         }
+        reset();
+    }
 
+    synchronized void reset() {
         // 单周期 SIMD 级机器字批量除以 2
         for (int w = 0; w < tableLongs; w++) {
             long wordOffset = (long) w * 8L;

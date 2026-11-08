@@ -38,6 +38,7 @@ public class ContinuousSoakStressEngine {
         // 解析参数
         long durationMinutes = 3; // 默认试跑3分钟展示实测，可通过参数传入更多 (如 10080 分钟 = 7天)
         int workerThreads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
+        EvictionPolicy policy = EvictionPolicy.WINDOW_TINY_LFU; // 默认采用 Caffeine Window TinyLFU 策略
 
         for (int i = 0; i < args.length; i++) {
             if ("--duration-minutes".equals(args[i]) && i + 1 < args.length) {
@@ -46,11 +47,18 @@ public class ContinuousSoakStressEngine {
                 durationMinutes = Long.parseLong(args[++i]) * 60;
             } else if ("--workers".equals(args[i]) && i + 1 < args.length) {
                 workerThreads = Integer.parseInt(args[++i]);
+            } else if (("--eviction-policy".equals(args[i]) || "--policy".equals(args[i])) && i + 1 < args.length) {
+                String p = args[++i].toUpperCase();
+                if (p.contains("LRU")) {
+                    policy = EvictionPolicy.K_SAMPLE_LRU;
+                } else {
+                    policy = EvictionPolicy.WINDOW_TINY_LFU;
+                }
             }
         }
 
-        System.out.printf("运行参数 : 工作线程数=%d, 规划持续时间=%,d 分钟 (%.1f 小时)\n",
-                workerThreads, durationMinutes, durationMinutes / 60.0);
+        System.out.printf("运行参数 : 工作线程数=%d, 规划持续时间=%,d 分钟 (%.1f 小时), 淘汰策略=%s\n",
+                workerThreads, durationMinutes, durationMinutes / 60.0, policy);
         System.out.println("宿主规格 : " + Runtime.getRuntime().availableProcessors() + " vCPU, JVM MaxMemory: " + (Runtime.getRuntime().maxMemory() / 1024 / 1024) + " MB\n");
 
         Path storageDir = Path.of("/home/antigravity/persistent_offheap_data");
@@ -61,16 +69,20 @@ public class ContinuousSoakStressEngine {
         // Files.deleteIfExists(logFile);
         // Files.deleteIfExists(edgeCaseLog);
 
-        runContinuousEngine(storageDir, logFile, edgeCaseLog, workerThreads, durationMinutes);
+        runContinuousEngine(storageDir, logFile, edgeCaseLog, workerThreads, durationMinutes, policy);
     }
 
-    static void runContinuousEngine(Path storageDir, Path logFile, Path edgeCaseLog, int workers, long durationMinutes) throws Exception {
+    static void runContinuousEngine(Path storageDir, Path logFile, Path edgeCaseLog, int workers, long durationMinutes, EvictionPolicy policy) throws Exception {
         long durationMs = (durationMinutes <= 0) ? Long.MAX_VALUE : durationMinutes * 60_000L;
         long deadline = (durationMinutes <= 0) ? Long.MAX_VALUE : (System.currentTimeMillis() + durationMs);
 
-        // 初始化或挂载持久化存储
+        // 初始化或挂载持久化存储 (支持指定淘汰策略)
+        PersistentOffHeapStore initialStore = PersistentOffHeapStore.builder()
+                .storageDir(storageDir)
+                .evictionPolicy(policy)
+                .build();
         java.util.concurrent.atomic.AtomicReference<PersistentOffHeapStore> storeRef =
-                new java.util.concurrent.atomic.AtomicReference<>(PersistentOffHeapStore.open(storageDir));
+                new java.util.concurrent.atomic.AtomicReference<>(initialStore);
 
         AtomicBoolean running = new AtomicBoolean(true);
         AtomicLong totalOps = new AtomicLong(0);
@@ -114,7 +126,13 @@ public class ContinuousSoakStressEngine {
                     }
                     long t0 = System.nanoTime();
                     try {
-                        int kIdx = rng.nextInt(keySpace);
+                        // 80% 请求命中前 15% 核心热点键 (Zipfian 倾斜)，20% 请求访问其余冷数据
+                        int kIdx;
+                        if (rng.nextInt(100) < 80) {
+                            kIdx = rng.nextInt((int) (keySpace * 0.15));
+                        } else {
+                            kIdx = rng.nextInt(keySpace);
+                        }
                         byte[] k = keyPool[kIdx];
                         int op = rng.nextInt(100);
 
@@ -206,7 +224,10 @@ public class ContinuousSoakStressEngine {
                     currentStore.close();
 
                     long tOpen0 = System.currentTimeMillis();
-                    PersistentOffHeapStore reopenedStore = PersistentOffHeapStore.open(storageDir);
+                    PersistentOffHeapStore reopenedStore = PersistentOffHeapStore.builder()
+                            .storageDir(storageDir)
+                            .evictionPolicy(policy)
+                            .build();
                     storeRef.set(reopenedStore);
                     long reopenCostMs = System.currentTimeMillis() - tOpen0;
 
@@ -248,7 +269,7 @@ public class ContinuousSoakStressEngine {
         for (var b : gcBeans) gcTimeBaseline += b.getCollectionTime();
 
         try (PrintWriter logWriter = new PrintWriter(new FileWriter(logFile.toFile(), true))) {
-            logWriter.println("TIMESTAMP | ELAPSED_S | TOTAL_OPS | OPS_PER_SEC | P50_US | P99_US | P999_US | ACTIVE_KEYS | OFFHEAP_MB | RESTARTS | ANOMALIES | GC_TIME_MS");
+            logWriter.println("TIMESTAMP | ELAPSED_S | TOTAL_OPS | OPS_PER_SEC | P50_US | P99_US | P999_US | HIT_RATE_% | HITS | MISSES | EVICTIONS | ACTIVE_KEYS | OFFHEAP_MB | RESTARTS | ANOMALIES | GC_TIME_MS");
 
             while (System.currentTimeMillis() < deadline) {
                 Thread.sleep(5000); // 每 5 秒输出一次全景监控快照
@@ -277,14 +298,16 @@ public class ContinuousSoakStressEngine {
                 long elapsedSec = (System.currentTimeMillis() - startWallTime) / 1000;
                 String timeStr = LocalDateTime.now().format(TIME_FMT);
 
-                String report = String.format("[%s] 运行: %4ds | 总操作: %,10d | 吞吐: %,7d ops/s | P50: %5.1fμs | P99: %6.1fμs | 存活键: %,6d | 堆外占用: %4d MB | 重启轮次: %2d | 异常/泄漏: %d | GC停顿: %d ms",
+                String report = String.format("[%s] 运行: %4ds | 总操作: %,10d | 吞吐: %,7d ops/s | P50: %5.1fμs | P99: %6.1fμs | 命中率: %5.2f%% (命中: %,d / 未命中: %,d) | 存活键: %,6d | 驱逐: %,d | 堆外占用: %4d MB | 重启轮次: %2d | 异常/泄漏: %d | GC停顿: %d ms",
                         timeStr, elapsedSec, currentOps, throughput, p50, p99,
-                        stats.activeEntries(), stats.allocatedBytes() / 1024 / 1024,
+                        stats.hitRate(), stats.hits(), stats.misses(),
+                        stats.activeEntries(), stats.evictions(), stats.allocatedBytes() / 1024 / 1024,
                         totalRestarts.get(), anomaliesDetected.get(), deltaGcTime);
 
                 System.out.println(report);
-                logWriter.printf("%s | %d | %d | %d | %.2f | %.2f | %.2f | %d | %d | %d | %d | %d\n",
+                logWriter.printf("%s | %d | %d | %d | %.2f | %.2f | %.2f | %.2f | %d | %d | %d | %d | %d | %d | %d | %d\n",
                         timeStr, elapsedSec, currentOps, throughput, p50, p99, p999,
+                        stats.hitRate(), stats.hits(), stats.misses(), stats.evictions(),
                         stats.activeEntries(), stats.allocatedBytes() / 1024 / 1024,
                         totalRestarts.get(), anomaliesDetected.get(), deltaGcTime);
                 logWriter.flush();

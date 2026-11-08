@@ -39,5 +39,9 @@ jobs:
       run: |
         java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.DualModeStorageTest
 
+    - name: Run Window TinyLFU Deep Verification Suite
+      run: |
+        java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.WindowTinyLfuDeepVerificationTest
+
     - name: Run Maven JUnit Tests
       run: mvn test

@@ -195,4 +195,90 @@ class OffHeapStoreJUnitTest {
             assertTrue(survived >= 45, "Window TinyLFU must protect hot keys against cold scans! Survived: " + survived + "/50");
         }
     }
+
+    @Test
+    @DisplayName("FrequencySketch: 4-Bit Saturated Counter & Single-Cycle Parallel Halving Decay")
+    void testFrequencySketchBitwiseSaturationAndDecay() {
+        try (OffHeapFrequencySketch sketch = new OffHeapFrequencySketch(1024, null)) {
+            long testHash = 0x123456789ABCDEFL;
+
+            assertEquals(0, sketch.estimate(testHash));
+
+            // Saturated at 15
+            for (int i = 0; i < 25; i++) {
+                sketch.record(testHash);
+            }
+            assertEquals(15, sketch.estimate(testHash), "4-bit counter must saturate at 15 without overflow");
+
+            // Verify SIMD halving sequence: 15 -> 7 -> 3 -> 1 -> 0
+            sketch.reset();
+            assertEquals(7, sketch.estimate(testHash));
+            sketch.reset();
+            assertEquals(3, sketch.estimate(testHash));
+            sketch.reset();
+            assertEquals(1, sketch.estimate(testHash));
+            sketch.reset();
+            assertEquals(0, sketch.estimate(testHash));
+        }
+    }
+
+    @Test
+    @DisplayName("Window TinyLFU: Hit Rate Superiority over Standard LRU under Mixed Scan Bursts")
+    void testWindowTinyLfuHitRateOutperformsLru() throws Exception {
+        int capacity = 200;
+        int distinctKeys = 2000;
+        int ops = 20000;
+        byte[] payload = new byte[32];
+
+        double lruHitRate = runBenchmarkWorkload(EvictionPolicy.K_SAMPLE_LRU, capacity, distinctKeys, ops, payload);
+        double tinyLfuHitRate = runBenchmarkWorkload(EvictionPolicy.WINDOW_TINY_LFU, capacity, distinctKeys, ops, payload);
+
+        assertTrue(tinyLfuHitRate > lruHitRate,
+                String.format("Window TinyLFU hit rate (%.2f%%) must outperform LRU (%.2f%%)", tinyLfuHitRate, lruHitRate));
+    }
+
+    private double runBenchmarkWorkload(EvictionPolicy policy, int capacity, int distinctKeys, int ops, byte[] payload) throws Exception {
+        int[] slotCounts = new int[11];
+        java.util.Arrays.fill(slotCounts, capacity);
+
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.builder()
+                .mode(StorageMode.IN_MEMORY)
+                .slotCounts(slotCounts)
+                .maxBuckets(512)
+                .evictionPolicy(policy)
+                .build()) {
+
+            byte[][] keyPool = new byte[distinctKeys][];
+            for (int i = 0; i < distinctKeys; i++) {
+                keyPool[i] = ("key:" + i).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            }
+
+            java.util.Random rng = new java.util.Random(9999);
+            long hits = 0;
+            long reads = 0;
+
+            for (int i = 0; i < ops; i++) {
+                int keyIdx;
+                if (rng.nextInt(100) < 15) {
+                    keyIdx = 1000 + rng.nextInt(distinctKeys - 1000); // 15% cold scan burst
+                } else {
+                    if (rng.nextInt(100) < 80) {
+                        keyIdx = rng.nextInt(100); // 80% hits top 100 keys
+                    } else {
+                        keyIdx = rng.nextInt(500);
+                    }
+                }
+
+                byte[] key = keyPool[keyIdx];
+                byte[] v = store.get(key);
+                reads++;
+                if (v != null) {
+                    hits++;
+                } else {
+                    store.put(key, payload);
+                }
+            }
+            return (double) hits / reads * 100.0;
+        }
+    }
 }
