@@ -350,7 +350,11 @@ public class ContinuousSoakStressEngine {
                 for (var b : gcBeans) currentGcTime += b.getCollectionTime();
                 long deltaGcTime = currentGcTime - gcTimeBaseline;
 
-                PersistentOffHeapStore.Stats stats = storeRef.get().getStats();
+                PersistentOffHeapStore store = storeRef.get();
+                if (store == null) {
+                    continue; // 正在进行崩溃重挂载，跳过此轮采样
+                }
+                PersistentOffHeapStore.Stats stats = store.getStats();
                 long elapsedSec = (System.currentTimeMillis() - startWallTime) / 1000;
                 String timeStr = LocalDateTime.now().format(TIME_FMT);
 
@@ -373,7 +377,10 @@ public class ContinuousSoakStressEngine {
             running.set(false);
             workerPool.shutdown();
             workerPool.awaitTermination(5, TimeUnit.SECONDS);
-            storeRef.get().close();
+            PersistentOffHeapStore finalStore = storeRef.get();
+            if (finalStore != null) {
+                finalStore.close();
+            }
         }
 
         System.out.println("\n================================================================================");
