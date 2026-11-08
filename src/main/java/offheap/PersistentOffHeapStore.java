@@ -9,6 +9,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -111,6 +112,10 @@ public class PersistentOffHeapStore implements AutoCloseable {
     private final Thread backgroundFlusher;
     private final Arena arena;
     private volatile boolean closed = false;
+
+    // 目录排他进程锁 (防御多进程并发挂载冲突导致 MMAP 内存踩踏与数据损坏)
+    private final FileChannel lockChannel;
+    private final FileLock storeFileLock;
 
     // 超级块元数据段与底层文件通道
     private final FileChannel metaChannel;
@@ -343,6 +348,8 @@ public class PersistentOffHeapStore implements AutoCloseable {
         }
 
         if (!persistent) {
+            this.lockChannel = null;
+            this.storeFileLock = null;
             // 纯内存模式
             this.bucketCount = nextPowerOfTwo(Math.max(64, maxBuckets));
             this.bucketMask = this.bucketCount - 1;
@@ -365,7 +372,16 @@ public class PersistentOffHeapStore implements AutoCloseable {
                 slabs[i].freeTop = cap;
             }
         } else {
-            // MMAP 持久化模式
+            // MMAP 持久化模式：首先获取目录独占进程级文件锁
+            Path lockFile = storageDir.resolve("store.lock");
+            this.lockChannel = FileChannel.open(lockFile,
+                    StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
+            this.storeFileLock = this.lockChannel.tryLock();
+            if (this.storeFileLock == null) {
+                closeQuietly(this.lockChannel);
+                throw new IllegalStateException("Storage directory is locked by another active process: " + storageDir);
+            }
+
             Path metaFile = storageDir.resolve("meta.dat");
             boolean isNewStore = !Files.exists(metaFile);
 
@@ -1748,6 +1764,11 @@ public class PersistentOffHeapStore implements AutoCloseable {
         long base = slab.getOffset(slotIdx);
         MemorySegment seg = slab.segment;
 
+        int magic = seg.get(ValueLayout.JAVA_INT, base + OFF_MAGIC);
+        if (magic != MAGIC_HEADER) {
+            return false;
+        }
+
         long slotHash = seg.get(ValueLayout.JAVA_LONG, base + OFF_HASH);
         if (slotHash != hash) {
             return false;
@@ -2219,6 +2240,12 @@ public class PersistentOffHeapStore implements AutoCloseable {
             }
             closeQuietly(indexChannel);
             closeQuietly(metaChannel);
+            if (storeFileLock != null && storeFileLock.isValid()) {
+                try {
+                    storeFileLock.release();
+                } catch (IOException ignored) {}
+            }
+            closeQuietly(lockChannel);
         }
     }
 }

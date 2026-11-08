@@ -83,6 +83,12 @@ public class ContinuousSoakStressEngine {
             }
         }
 
+        Path pidFile = Path.of("/home/antigravity/soak_engine.pid");
+        Files.writeString(pidFile, String.valueOf(ProcessHandle.current().pid()));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { Files.deleteIfExists(pidFile); } catch (Exception ignored) {}
+        }));
+
         runContinuousEngine(storageDir, logFile, edgeCaseLog, workerThreads, durationMinutes, policy, slotsPerClass, keySpace);
     }
 

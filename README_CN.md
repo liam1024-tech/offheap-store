@@ -27,6 +27,9 @@
 * **Redis 式 O(1) 采样近似 LRU 淘汰**：采用纳秒级单调时钟与独立随机抽样 ($K=10$)，在缓存满载淘汰时保持 **100% 核心热点数据驻留率**。
 * **Caffeine 级 Window TinyLFU 缓存淘汰与准入门禁**：内置纯堆外 4-bit 饱和计数器（0..15）Count-Min Sketch 与 Staff-Murmur64 四路哈希扰动，单周期位运算周期性衰减。彻底免疫全表扫描与周期性冷数据污染，实测 20,000 次冷扫描下 **热数据驻留率高达 100%**（传统 LRU 降至 0% 全军覆没）。
 * **11 阶 Slab 物理内存隔离分配器**：64 B 至 64 KB 二进制阶跃槽位，零外部内存碎片。
+* **多进程目录排他文件锁 (`FileLock`)**：持久化模式内置操作系统级排他锁 (`store.lock`)，杜绝多 JVM 实例并发挂载同一物理 MMAP 目录造成数据踩踏损坏。
+* **槽位魔数前置防御校验**：`matchesKey` 增加 `magic == MAGIC_HEADER` 状态前置过滤，消除槽位释放与并发驱逐读写冲突。
+* **7天长效高压压测与 10 分钟自动巡检套件**：配套包含 `run_7day_soak.sh`、`check_soak_status.sh`、`patrol_daemon.sh`、`patrol_analyzer.py`，支持无人值守指标漂移分析与闭环自愈诊断。
 * **长效稳定性验证**：已历经 10 大极限企业级实战对抗（Chronicle Map 零分配探测、Zipfian 热点轰炸、RocksDB 模型对账、LMDB 强行 close 吊销、W-TinyLFU 冷扫描防击穿）与超 8 亿次连续高并发混沌压测，零内存泄漏。
 
 ---

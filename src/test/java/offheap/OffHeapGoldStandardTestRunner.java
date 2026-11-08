@@ -220,8 +220,8 @@ public class OffHeapGoldStandardTestRunner {
         System.out.println(" [测试 4] 内存耗尽 (OOM) 拒绝与事务原子性 (原子性覆写保证 0 数据丢失)");
         System.out.println("────────────────────────────────────────────────────────────────────────────────");
 
-        // 创建微型 Store：每个 Slab 仅限 3 个槽位
-        try (OffHeapStore store = new OffHeapStore(64, 3)) {
+        // 创建微型 Store：每个 Slab 仅限 3 个槽位，显式关闭淘汰以验证物理 OOM 阻断与事务原子性
+        try (OffHeapStore store = new OffHeapStore(64, 3).setLruEvictionEnabled(false)) {
             // 4.1 塞满 Slab 0 (64B)
             byte[] k1 = "k1".getBytes();
             byte[] k2 = "k2".getBytes();

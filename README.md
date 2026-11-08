@@ -28,6 +28,9 @@
 * **Redis-Style O(1) Sample-Based LRU**: Independent random slot sampling ($K=10$) with nanosecond access tracking (`System.nanoTime()`), achieving 100% hot-key retention under severe cache eviction pressure.
 * **Caffeine-Style Window TinyLFU Eviction & Admission Policy**: Industrial-grade off-heap 4-bit Count-Min Sketch (`OffHeapFrequencySketch`) with 4-way Staff-Murmur64 hash spreading, lock-free CAS, and single-cycle bitwise halving decay. Completely defeats full-table scans and cache pollution (**100% hot-key survival** vs **0%** under plain LRU across 20,000 cold scans).
 * **Slab Allocator (11 Power-of-Two Classes)**: Segregated fit slabs (64 B to 64 KB) eliminate external memory fragmentation.
+* **Multi-Process FileLock Directory Defense**: Persistent mode embeds an exclusive OS-level `FileLock` (`store.lock`). Prevents multiple JVM processes from accidentally mounting the same physical MMAP directory and corrupting data.
+* **Slot Magic Header Verification**: Added front-line `magic == MAGIC_HEADER` validation in `matchesKey` to eliminate race conditions with concurrently freed or evicted slots.
+* **7-Day Continuous Soak & Automated Patrol Suite**: Bundled with production-grade soak engine and patrol scripts (`run_7day_soak.sh`, `check_soak_status.sh`, `patrol_daemon.sh`, `patrol_analyzer.py`) for automated 10-minute drift detection and closed-loop self-healing.
 * **Battle Tested**: Verified across 10 extreme enterprise scenarios (Zipfian contention, RocksDB oracle reconciliation, LMDB ungraceful revocation, W-TinyLFU cold scan defense, and >800M continuous soak operations with zero leaks).
 
 ---
@@ -102,7 +105,7 @@ Add the JVM flag `--enable-native-access=ALL-UNNAMED` to allow Java FFM access w
     <dependency>
         <groupId>io.github.liam1024-tech</groupId>
         <artifactId>offheap-store</artifactId>
-        <version>1.2.4</version>
+        <version>1.2.5</version>
     </dependency>
 </dependencies>
 ```
