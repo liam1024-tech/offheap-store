@@ -151,4 +151,48 @@ class OffHeapStoreJUnitTest {
             assertArrayEquals(val, store.get(key), "Value must be fully recovered across reopen");
         }
     }
+
+    @Test
+    @DisplayName("Window TinyLFU: Eviction Policy and Frequency Sketch Admission")
+    void testWindowTinyLfuEviction() throws Exception {
+        int[] cap = new int[11];
+        java.util.Arrays.fill(cap, 50);
+
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.builder()
+                .mode(StorageMode.IN_MEMORY)
+                .maxBuckets(128)
+                .slotCounts(cap)
+                .evictionPolicy(EvictionPolicy.WINDOW_TINY_LFU)
+                .build()) {
+
+            assertEquals(EvictionPolicy.WINDOW_TINY_LFU, store.getEvictionPolicy());
+            assertNotNull(store.getFrequencySketch());
+
+            byte[] payload = new byte[16];
+
+            // 1. Fill 50 slots and access hot keys
+            for (int i = 0; i < 50; i++) {
+                assertTrue(store.put(("hot:" + i).getBytes(), payload));
+            }
+            for (int r = 0; r < 5; r++) {
+                for (int i = 0; i < 50; i++) {
+                    assertNotNull(store.get(("hot:" + i).getBytes()));
+                }
+            }
+
+            // 2. Perform 2,000 cold scans
+            for (int i = 0; i < 2_000; i++) {
+                store.put(("cold:scan:" + i).getBytes(), payload);
+            }
+
+            // 3. Verify hot keys survived against cold scans
+            int survived = 0;
+            for (int i = 0; i < 50; i++) {
+                if (store.containsKey(("hot:" + i).getBytes())) {
+                    survived++;
+                }
+            }
+            assertTrue(survived >= 45, "Window TinyLFU must protect hot keys against cold scans! Survived: " + survived + "/50");
+        }
+    }
 }

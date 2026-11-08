@@ -39,7 +39,7 @@ TEST_SOURCES=$(ls src/test/java/offheap/*.java | grep -v "JUnit" || true)
 echo -e "\n========================================================"
 echo "  Build SUCCESS! All components compiled without errors."
 echo "========================================================"
-echo -e "\nTo run the 9 Extreme Battle Tests directly:"
+echo -e "\nTo run the 10 Extreme Battle Tests directly:"
 echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest"
 echo -e "\nTo run Dual Mode Verification:"
 echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.DualModeStorageTest"

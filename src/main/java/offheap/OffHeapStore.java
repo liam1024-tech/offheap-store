@@ -62,7 +62,9 @@ public class OffHeapStore implements AutoCloseable {
     // 共享堆外内存生命周期区域
     private final Arena arena;
     private volatile boolean closed = false;
-    private volatile boolean lruEvictionEnabled = false;
+    private volatile boolean lruEvictionEnabled = true;
+    private volatile EvictionPolicy evictionPolicy = EvictionPolicy.WINDOW_TINY_LFU;
+    private final OffHeapFrequencySketch frequencySketch;
 
     // 哈希索引表 (纯堆外)
     private final MemorySegment indexSegment;
@@ -211,7 +213,20 @@ public class OffHeapStore implements AutoCloseable {
      * @param slotCounts 每个 Slab 级别的槽位容量数组
      */
     public OffHeapStore(int maxBuckets, int[] slotCounts) {
+        this(maxBuckets, slotCounts, EvictionPolicy.WINDOW_TINY_LFU);
+    }
+
+    /**
+     * 创建堆外存储实例 (可指定淘汰策略)
+     *
+     * @param maxBuckets 索引桶数量 (自动对齐至 2 的幂)
+     * @param slotCounts 每个 Slab 级别的槽位容量数组
+     * @param evictionPolicy 淘汰与准入门禁策略
+     */
+    public OffHeapStore(int maxBuckets, int[] slotCounts, EvictionPolicy evictionPolicy) {
         this.arena = Arena.ofShared();
+        this.lruEvictionEnabled = true;
+        this.evictionPolicy = (evictionPolicy != null) ? evictionPolicy : EvictionPolicy.WINDOW_TINY_LFU;
 
         // 1. 初始化索引桶 (取 2 的幂以支持位运算哈希定位)
         this.bucketCount = nextPowerOfTwo(Math.max(64, maxBuckets));
@@ -233,10 +248,15 @@ public class OffHeapStore implements AutoCloseable {
 
         // 3. 初始化多阶 Slab 分配器
         this.slabs = new SlabClass[SLAB_CLASSES.length];
+        int totalCap = 0;
         for (int i = 0; i < SLAB_CLASSES.length; i++) {
             int capacity = (i < slotCounts.length) ? slotCounts[i] : 1024;
             this.slabs[i] = new SlabClass(i, SLAB_CLASSES[i], capacity, arena);
+            totalCap += capacity;
         }
+
+        // 4. 初始化 4-bit Count-Min 频率草图 (供 Window TinyLFU 门禁准入)
+        this.frequencySketch = new OffHeapFrequencySketch(Math.max(totalCap, bucketCount), this.arena);
     }
 
     // 句柄编码与解码 (内联 15-bit 寄存器级哈希指纹)：
@@ -273,6 +293,20 @@ public class OffHeapStore implements AutoCloseable {
 
     public boolean isLruEvictionEnabled() {
         return lruEvictionEnabled;
+    }
+
+    public OffHeapStore setEvictionPolicy(EvictionPolicy policy) {
+        this.evictionPolicy = Objects.requireNonNull(policy, "policy cannot be null");
+        this.lruEvictionEnabled = true;
+        return this;
+    }
+
+    public EvictionPolicy getEvictionPolicy() {
+        return evictionPolicy;
+    }
+
+    public OffHeapFrequencySketch getFrequencySketch() {
+        return frequencySketch;
     }
 
     public long getFingerprintSkips() {
@@ -313,9 +347,12 @@ public class OffHeapStore implements AutoCloseable {
                     int oldClass = decodeClassIdx(currHandle);
                     if (oldClass == classIdx) {
                         writeRecord(currHandle, hash, key, val, ttlMs);
+                        if (frequencySketch != null) {
+                            frequencySketch.record(hash);
+                        }
                         return true;
                     } else {
-                        int newSlotIdx = allocateSlotWithEviction(classIdx);
+                        int newSlotIdx = allocateSlotWithEviction(classIdx, hash);
                         if (newSlotIdx < 0) {
                             return false;
                         }
@@ -332,6 +369,9 @@ public class OffHeapStore implements AutoCloseable {
                         long currentHead = indexSegment.getAtIndex(ValueLayout.JAVA_LONG, bucket);
                         setNextHandle(newHandle, currentHead);
                         indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, newHandle);
+                        if (frequencySketch != null) {
+                            frequencySketch.record(hash);
+                        }
                         return true;
                     }
                 }
@@ -340,7 +380,7 @@ public class OffHeapStore implements AutoCloseable {
             }
 
             // 2. 分配新槽位 (新增条目)
-            int slotIdx = allocateSlotWithEviction(classIdx);
+            int slotIdx = allocateSlotWithEviction(classIdx, hash);
             if (slotIdx < 0) {
                 return false;
             }
@@ -353,6 +393,9 @@ public class OffHeapStore implements AutoCloseable {
             indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, newHandle);
 
             entryCount.incrementAndGet();
+            if (frequencySketch != null) {
+                frequencySketch.record(hash);
+            }
             return true;
         } finally {
             lock.unlock();
@@ -372,7 +415,7 @@ public class OffHeapStore implements AutoCloseable {
                     return true;
                 } else {
                     // 规格变更：先尝试为新规格分配槽位 (Failure Atomicity 事务原子性)
-                    int newSlotIdx = allocateSlotWithEviction(classIdx);
+                    int newSlotIdx = allocateSlotWithEviction(classIdx, hash);
                     if (newSlotIdx < 0) {
                         return false; // 分配失败，保留原条目，绝不丢失数据！
                     }
@@ -399,7 +442,7 @@ public class OffHeapStore implements AutoCloseable {
         }
 
         // 2. 分配新槽位 (新增条目)
-        int slotIdx = allocateSlotWithEviction(classIdx);
+        int slotIdx = allocateSlotWithEviction(classIdx, hash);
         if (slotIdx < 0) {
             return false; // 依然不足，写入拒绝
         }
@@ -418,14 +461,20 @@ public class OffHeapStore implements AutoCloseable {
         return true;
     }
 
-    private int allocateSlotWithEviction(int classIdx) {
+    private int allocateSlotWithEviction(int classIdx, long candidateHash) {
         int slotIdx = slabs[classIdx].allocateSlot();
         if (slotIdx < 0) {
             if (tryEvictExpired()) {
                 slotIdx = slabs[classIdx].allocateSlot();
             }
             if (slotIdx < 0 && lruEvictionEnabled) {
-                if (evictLruInSlab(classIdx)) {
+                boolean evicted;
+                if (evictionPolicy == EvictionPolicy.WINDOW_TINY_LFU && frequencySketch != null) {
+                    evicted = evictTinyLfuInSlab(classIdx, candidateHash);
+                } else {
+                    evicted = evictLruInSlab(classIdx);
+                }
+                if (evicted) {
                     slotIdx = slabs[classIdx].allocateSlot();
                 }
             }
@@ -479,7 +528,11 @@ public class OffHeapStore implements AutoCloseable {
                 prevHandle = currHandle;
                 currHandle = getNextHandle(currHandle);
             }
-            return putUnderStripeLock(bucket, hash, key, val, ttlMs, classIdx);
+            boolean ok = putUnderStripeLock(bucket, hash, key, val, ttlMs, classIdx);
+            if (ok && frequencySketch != null) {
+                frequencySketch.record(hash);
+            }
+            return ok;
         } finally {
             lock.unlock();
         }
@@ -535,9 +588,12 @@ public class OffHeapStore implements AutoCloseable {
                     int oldClass = decodeClassIdx(currHandle);
                     if (oldClass == newClassIdx) {
                         writeRecord(currHandle, hash, key, newVal, ttlMs);
+                        if (frequencySketch != null) {
+                            frequencySketch.record(hash);
+                        }
                         return true;
                     } else {
-                        int newSlotIdx = allocateSlotWithEviction(newClassIdx);
+                        int newSlotIdx = allocateSlotWithEviction(newClassIdx, hash);
                         if (newSlotIdx < 0) {
                             return false;
                         }
@@ -554,6 +610,9 @@ public class OffHeapStore implements AutoCloseable {
                         long currentHead = indexSegment.getAtIndex(ValueLayout.JAVA_LONG, bucket);
                         setNextHandle(newHandle, currentHead);
                         indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, newHandle);
+                        if (frequencySketch != null) {
+                            frequencySketch.record(hash);
+                        }
                         return true;
                     }
                 }
@@ -610,9 +669,12 @@ public class OffHeapStore implements AutoCloseable {
                         int oldClass = decodeClassIdx(currHandle);
                         if (oldClass == newClassIdx) {
                             writeRecord(currHandle, hash, key, newVal, ttlMs);
+                            if (frequencySketch != null) {
+                                frequencySketch.record(hash);
+                            }
                             return oldVal;
                         } else {
-                            int newSlotIdx = allocateSlotWithEviction(newClassIdx);
+                            int newSlotIdx = allocateSlotWithEviction(newClassIdx, hash);
                             if (newSlotIdx < 0) {
                                 return null;
                             }
@@ -629,6 +691,9 @@ public class OffHeapStore implements AutoCloseable {
                             long currentHead = indexSegment.getAtIndex(ValueLayout.JAVA_LONG, bucket);
                             setNextHandle(newHandle, currentHead);
                             indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, newHandle);
+                            if (frequencySketch != null) {
+                                frequencySketch.record(hash);
+                            }
                             return oldVal;
                         }
                     }
@@ -637,7 +702,7 @@ public class OffHeapStore implements AutoCloseable {
                 currHandle = getNextHandle(currHandle);
             }
 
-            int slotIdx = allocateSlotWithEviction(newClassIdx);
+            int slotIdx = allocateSlotWithEviction(newClassIdx, hash);
             if (slotIdx >= 0) {
                 long newHandle = encodeHandle(newClassIdx, slotIdx, hash);
                 writeRecord(newHandle, hash, key, newVal, ttlMs);
@@ -645,6 +710,9 @@ public class OffHeapStore implements AutoCloseable {
                 setNextHandle(newHandle, oldHead);
                 indexSegment.setAtIndex(ValueLayout.JAVA_LONG, bucket, newHandle);
                 entryCount.incrementAndGet();
+                if (frequencySketch != null) {
+                    frequencySketch.record(hash);
+                }
             }
             return null;
         } finally {
@@ -706,6 +774,9 @@ public class OffHeapStore implements AutoCloseable {
                 int needed = (int) (HEADER_SIZE + k.length + v.length + CRC_FOOTER_SIZE);
                 int classIdx = findSlabClass(needed);
                 if (putUnderStripeLock(bucket, hash, k, v, ttlMs, classIdx)) {
+                    if (frequencySketch != null) {
+                        frequencySketch.record(hash);
+                    }
                     successCount++;
                 }
             }
@@ -804,6 +875,9 @@ public class OffHeapStore implements AutoCloseable {
                     results.add(null);
                 } else if (val != null) {
                     hits++;
+                    if (frequencySketch != null) {
+                        frequencySketch.record(hash);
+                    }
                     results.add(val);
                 } else {
                     misses++;
@@ -923,6 +997,9 @@ public class OffHeapStore implements AutoCloseable {
         }
 
         hitCount.incrementAndGet();
+        if (frequencySketch != null) {
+            frequencySketch.record(hash);
+        }
         return val;
     }
 
@@ -1258,6 +1335,116 @@ public class OffHeapStore implements AutoCloseable {
             }
         }
         return evictedAny;
+    }
+
+    /**
+     * Caffeine 式 Window TinyLFU 门禁准入与频次偏向淘汰 (0 堆内存分配，无死锁)：
+     * 1. 在目标 Slab 中随机抽样 K=10 个有效占用槽位；
+     * 2. 若发现过期槽位，立即无条件淘汰并回收空间 (最高淘汰优先级)；
+     * 3. 否则估算各样本的访问频次 (0~15)，选出频次最低的牺牲者 (Victim)；同频次时以最久未访问 (LRU) 决胜负；
+     * 4. 门禁准入裁判 (TinyLFU Admission Gate)：
+     *    - 若 候选者频次 (Candidate) > 牺牲者频次 (Victim)：准入候选者，淘汰牺牲者！
+     *    - 若 候选者频次 < 牺牲者频次：
+     *      若牺牲者具备热度且候选者为冷门数据，拒绝准入并放弃淘汰，保护热点数据免受全表扫描污染；
+     *      提供 3% 随机探针窗口旁路 (Window Cache Bypass)，给予全新突发流量孵化机会，杜绝饥饿；
+     *    - 若频次相等：按 LRU 规则淘汰最久样本并准入候选者。
+     */
+    private boolean evictTinyLfuInSlab(int classIdx, long candidateHash) {
+        SlabClass slab = slabs[classIdx];
+        int cap = slab.capacity;
+        if (cap <= 0) return false;
+
+        MemorySegment seg = slab.segment;
+        long now = System.currentTimeMillis();
+        int maxProbes = Math.min(cap, 32);
+        int targetSamples = Math.min(10, cap);
+        var rng = java.util.concurrent.ThreadLocalRandom.current();
+
+        int candidateFreq = (frequencySketch != null) ? frequencySketch.estimate(candidateHash) : 0;
+
+        for (int attempt = 0; attempt < 3; attempt++) {
+            int victimSlot = -1;
+            int victimFreq = Integer.MAX_VALUE;
+            long victimLastAccess = Long.MAX_VALUE;
+            long victimHash = 0L;
+            int validSampled = 0;
+
+            for (int i = 0; i < maxProbes && validSampled < targetSamples; i++) {
+                int slot = rng.nextInt(cap);
+                long base = slab.getOffset(slot);
+                int magic = seg.get(ValueLayout.JAVA_INT, base + OFF_MAGIC);
+                if (magic != MAGIC_HEADER) continue;
+
+                validSampled++;
+                long expireAt = seg.get(ValueLayout.JAVA_LONG, base + OFF_EXPIRE_AT);
+                if (expireAt > 0 && now > expireAt) {
+                    // 已过期条目拥有绝对最高淘汰优先级，无视门禁立即淘汰！
+                    victimSlot = slot;
+                    victimHash = seg.get(ValueLayout.JAVA_LONG, base + OFF_HASH);
+                    victimFreq = -1;
+                    break;
+                }
+
+                long h = seg.get(ValueLayout.JAVA_LONG, base + OFF_HASH);
+                int freq = (frequencySketch != null) ? frequencySketch.estimate(h) : 0;
+                long lastAccess = seg.get(ValueLayout.JAVA_LONG, base + OFF_LAST_ACCESS);
+
+                if (victimSlot == -1 || freq < victimFreq || (freq == victimFreq && lastAccess < victimLastAccess)) {
+                    victimSlot = slot;
+                    victimFreq = freq;
+                    victimLastAccess = lastAccess;
+                    victimHash = h;
+                }
+            }
+
+            if (victimSlot < 0) {
+                return false;
+            }
+
+            // 门禁准入判定 (Admission Gate)
+            if (victimFreq >= 0) { // 非过期项才需经门禁裁判
+                if (candidateFreq < victimFreq) {
+                    // 若牺牲者是已建立频次的热点数据 (victimFreq >= 2)，而候选者频次较低：
+                    // 严格拦截，保护热点免遭全表扫描污染！
+                    if (victimFreq >= 2) {
+                        return false;
+                    }
+                    // 若牺牲者本身也只是冷数据 (victimFreq <= 1)，提供 10% 准入置换概率给全新热点孵化
+                    if (rng.nextInt(10) != 0) {
+                        return false;
+                    }
+                }
+            }
+
+            int b = (int) (victimHash & bucketMask);
+            int stripe = b & stripeMask;
+            var lock = locks[stripe].writeLock();
+            if (lock.tryLock()) {
+                try {
+                    long curr = indexSegment.getAtIndex(ValueLayout.JAVA_LONG, b);
+                    long prev = -1L;
+                    while (curr != -1L) {
+                        if (decodeClassIdx(curr) == classIdx && decodeSlotIdx(curr) == victimSlot) {
+                            long next = getNextHandle(curr);
+                            if (prev == -1L) {
+                                indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, next);
+                            } else {
+                                setNextHandle(prev, next);
+                            }
+                            freeHandle(curr);
+                            entryCount.decrementAndGet();
+                            evictionCount.incrementAndGet();
+                            return true;
+                        }
+                        prev = curr;
+                        curr = getNextHandle(curr);
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            }
+        }
+        return false;
     }
 
     /**

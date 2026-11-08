@@ -125,6 +125,10 @@ public class PersistentOffHeapStore implements AutoCloseable {
     // 多阶 Slab 管理结构
     private final SlabClass[] slabs;
 
+    // 缓存淘汰策略与纯堆外 W-TinyLFU 频率草图
+    private final EvictionPolicy evictionPolicy;
+    private final OffHeapFrequencySketch frequencySketch;
+
     // 运行指标统计
     private final AtomicLong entryCount = new AtomicLong(0);
     private final AtomicLong hitCount = new AtomicLong(0);
@@ -203,12 +207,16 @@ public class PersistentOffHeapStore implements AutoCloseable {
      * @param slotCounts 槽位容量规划 (若目录已存在，优先按已保存的元数据加载)
      */
     public static PersistentOffHeapStore open(Path storageDir, int maxBuckets, int[] slotCounts) throws IOException {
+        return open(storageDir, maxBuckets, slotCounts, EvictionPolicy.WINDOW_TINY_LFU);
+    }
+
+    public static PersistentOffHeapStore open(Path storageDir, int maxBuckets, int[] slotCounts, EvictionPolicy evictionPolicy) throws IOException {
         Files.createDirectories(storageDir);
-        return new PersistentOffHeapStore(storageDir, StorageMode.PERSISTENT, SyncPolicy.MANUAL, 1000L, maxBuckets, slotCounts);
+        return new PersistentOffHeapStore(storageDir, StorageMode.PERSISTENT, SyncPolicy.MANUAL, 1000L, maxBuckets, slotCounts, evictionPolicy);
     }
 
     public static PersistentOffHeapStore open(Path storageDir) throws IOException {
-        return open(storageDir, 65536, DEFAULT_SLOT_COUNTS);
+        return open(storageDir, 65536, DEFAULT_SLOT_COUNTS, EvictionPolicy.WINDOW_TINY_LFU);
     }
 
     /**
@@ -222,16 +230,24 @@ public class PersistentOffHeapStore implements AutoCloseable {
         return open(storageDir, maxBuckets, slotCounts);
     }
 
+    public static PersistentOffHeapStore persistent(Path storageDir, int maxBuckets, int[] slotCounts, EvictionPolicy evictionPolicy) throws IOException {
+        return open(storageDir, maxBuckets, slotCounts, evictionPolicy);
+    }
+
     /**
      * 纯内存模式工厂方法 (纯堆外直接内存，0 磁盘 I/O，极速吞吐)
      */
     public static PersistentOffHeapStore inMemory() {
-        return inMemory(65536, DEFAULT_SLOT_COUNTS);
+        return inMemory(65536, DEFAULT_SLOT_COUNTS, EvictionPolicy.WINDOW_TINY_LFU);
     }
 
     public static PersistentOffHeapStore inMemory(int maxBuckets, int[] slotCounts) {
+        return inMemory(maxBuckets, slotCounts, EvictionPolicy.WINDOW_TINY_LFU);
+    }
+
+    public static PersistentOffHeapStore inMemory(int maxBuckets, int[] slotCounts, EvictionPolicy evictionPolicy) {
         try {
-            return new PersistentOffHeapStore(null, StorageMode.IN_MEMORY, SyncPolicy.MANUAL, 1000L, maxBuckets, slotCounts);
+            return new PersistentOffHeapStore(null, StorageMode.IN_MEMORY, SyncPolicy.MANUAL, 1000L, maxBuckets, slotCounts, evictionPolicy);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -251,6 +267,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
         private Path storageDir;
         private int maxBuckets = 65536;
         private int[] slotCounts = DEFAULT_SLOT_COUNTS;
+        private EvictionPolicy evictionPolicy = EvictionPolicy.WINDOW_TINY_LFU;
 
         public Builder mode(StorageMode mode) {
             this.mode = Objects.requireNonNull(mode, "mode cannot be null");
@@ -285,26 +302,32 @@ public class PersistentOffHeapStore implements AutoCloseable {
             return this;
         }
 
+        public Builder evictionPolicy(EvictionPolicy evictionPolicy) {
+            this.evictionPolicy = Objects.requireNonNull(evictionPolicy, "evictionPolicy cannot be null");
+            return this;
+        }
+
         public PersistentOffHeapStore build() throws IOException {
             if (mode == StorageMode.PERSISTENT) {
                 if (storageDir == null) {
                     throw new IllegalArgumentException("storageDir must be specified for PERSISTENT mode!");
                 }
                 Files.createDirectories(storageDir);
-                return new PersistentOffHeapStore(storageDir, StorageMode.PERSISTENT, syncPolicy, flushIntervalMs, maxBuckets, slotCounts);
+                return new PersistentOffHeapStore(storageDir, StorageMode.PERSISTENT, syncPolicy, flushIntervalMs, maxBuckets, slotCounts, evictionPolicy);
             } else {
-                return new PersistentOffHeapStore(null, StorageMode.IN_MEMORY, syncPolicy, flushIntervalMs, maxBuckets, slotCounts);
+                return new PersistentOffHeapStore(null, StorageMode.IN_MEMORY, syncPolicy, flushIntervalMs, maxBuckets, slotCounts, evictionPolicy);
             }
         }
     }
 
     private PersistentOffHeapStore(Path storageDir, StorageMode mode, SyncPolicy syncPolicy, long flushIntervalMs,
-                                   int maxBuckets, int[] slotCounts) throws IOException {
+                                   int maxBuckets, int[] slotCounts, EvictionPolicy evictionPolicy) throws IOException {
         this.storageDir = storageDir;
         this.storageMode = mode;
         this.persistent = (mode == StorageMode.PERSISTENT);
         this.syncPolicy = syncPolicy;
         this.flushIntervalMs = flushIntervalMs;
+        this.evictionPolicy = (evictionPolicy != null) ? evictionPolicy : EvictionPolicy.WINDOW_TINY_LFU;
         this.arena = Arena.ofShared();
 
         // 初始化分段锁
@@ -408,7 +431,18 @@ public class PersistentOffHeapStore implements AutoCloseable {
             recoverAndRebuild(!isNewStore);
         }
 
-        // 5. 若配置为后台周期性异步刷盘，启动守护线程
+        // 5. 初始化纯堆外 4-bit Count-Min 频率草图 (供 Window TinyLFU 门禁准入)
+        int totalCap = 0;
+        for (SlabClass slab : slabs) {
+            totalCap += slab.capacity;
+        }
+        if (this.evictionPolicy == EvictionPolicy.WINDOW_TINY_LFU) {
+            this.frequencySketch = new OffHeapFrequencySketch(Math.max(totalCap, bucketCount), this.arena);
+        } else {
+            this.frequencySketch = null;
+        }
+
+        // 6. 若配置为后台周期性异步刷盘，启动守护线程
         if (this.persistent && this.syncPolicy == SyncPolicy.PERIODIC_BACKGROUND) {
             this.backgroundFlusher = Thread.ofPlatform()
                     .daemon(true)
@@ -652,7 +686,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
                         ok = true;
                         return true;
                     } else {
-                        int newSlotIdx = allocateSlotWithEviction(classIdx);
+                        int newSlotIdx = allocateSlotWithEviction(classIdx, hash);
                         if (newSlotIdx < 0) {
                             return false;
                         }
@@ -677,7 +711,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
                 currHandle = getNextHandle(currHandle);
             }
 
-            int slotIdx = allocateSlotWithEviction(classIdx);
+            int slotIdx = allocateSlotWithEviction(classIdx, hash);
             if (slotIdx < 0) {
                 return false;
             }
@@ -695,6 +729,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
         } finally {
             lock.unlock();
             if (ok) {
+                if (frequencySketch != null) {
+                    frequencySketch.record(hash);
+                }
                 onMutationCompleted();
             }
         }
@@ -721,7 +758,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
                     return true;
                 } else {
                     // 规格变更：先尝试为新规格分配槽位 (Failure Atomicity 事务原子性)
-                    int newSlotIdx = allocateSlotWithEviction(classIdx);
+                    int newSlotIdx = allocateSlotWithEviction(classIdx, hash);
                     if (newSlotIdx < 0) {
                         return false; // 分配失败，保留原条目，绝不丢失数据！
                     }
@@ -748,7 +785,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
         }
 
         // 2. 分配新槽位 (新增条目)
-        int slotIdx = allocateSlotWithEviction(classIdx);
+        int slotIdx = allocateSlotWithEviction(classIdx, hash);
         if (slotIdx < 0) {
             return false;
         }
@@ -767,14 +804,20 @@ public class PersistentOffHeapStore implements AutoCloseable {
         return true;
     }
 
-    private int allocateSlotWithEviction(int classIdx) {
+    private int allocateSlotWithEviction(int classIdx, long candidateHash) {
         int slotIdx = slabs[classIdx].allocateSlot();
         if (slotIdx < 0) {
             if (tryEvictExpired()) {
                 slotIdx = slabs[classIdx].allocateSlot();
             }
             if (slotIdx < 0) {
-                if (evictLruInSlab(classIdx)) {
+                boolean evicted;
+                if (evictionPolicy == EvictionPolicy.WINDOW_TINY_LFU && frequencySketch != null) {
+                    evicted = evictTinyLfuInSlab(classIdx, candidateHash);
+                } else {
+                    evicted = evictLruInSlab(classIdx);
+                }
+                if (evicted) {
                     slotIdx = slabs[classIdx].allocateSlot();
                 }
             }
@@ -834,6 +877,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
             lock.unlock();
         }
         if (ok) {
+            if (frequencySketch != null) {
+                frequencySketch.record(hash);
+            }
             onMutationCompleted();
         }
         return ok;
@@ -901,7 +947,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
                         swapped = true;
                         return true;
                     } else {
-                        int newSlotIdx = allocateSlotWithEviction(newClassIdx);
+                        int newSlotIdx = allocateSlotWithEviction(newClassIdx, hash);
                         if (newSlotIdx < 0) {
                             return false; // 事务原子性：新槽位分配失败则保留原值
                         }
@@ -929,6 +975,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
         } finally {
             lock.unlock();
             if (swapped) {
+                if (frequencySketch != null) {
+                    frequencySketch.record(hash);
+                }
                 onMutationCompleted();
             }
         }
@@ -987,7 +1036,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
                             mutated = true;
                             return oldVal;
                         } else {
-                            int newSlotIdx = allocateSlotWithEviction(newClassIdx);
+                            int newSlotIdx = allocateSlotWithEviction(newClassIdx, hash);
                             if (newSlotIdx < 0) {
                                 return null;
                             }
@@ -1014,7 +1063,7 @@ public class PersistentOffHeapStore implements AutoCloseable {
             }
 
             // 键不存在或已清理，插入新槽位
-            int slotIdx = allocateSlotWithEviction(newClassIdx);
+            int slotIdx = allocateSlotWithEviction(newClassIdx, hash);
             if (slotIdx >= 0) {
                 long newHandle = encodeHandle(newClassIdx, slotIdx, hash);
                 writeRecord(newHandle, hash, key, newVal, ttlMs);
@@ -1028,6 +1077,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
         } finally {
             lock.unlock();
             if (mutated) {
+                if (frequencySketch != null) {
+                    frequencySketch.record(hash);
+                }
                 onMutationCompleted();
             }
         }
@@ -1095,6 +1147,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
                 int needed = (int) (HEADER_SIZE + k.length + v.length + CRC_FOOTER_SIZE);
                 int classIdx = findSlabClass(needed);
                 if (putUnderStripeLock(bucket, hash, k, v, ttlMs, classIdx)) {
+                    if (frequencySketch != null) {
+                        frequencySketch.record(hash);
+                    }
                     successCount++;
                 }
             }
@@ -1198,6 +1253,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
                     results.add(null);
                 } else if (val != null) {
                     hits++;
+                    if (frequencySketch != null) {
+                        frequencySketch.record(hash);
+                    }
                     results.add(val);
                 } else {
                     misses++;
@@ -1317,6 +1375,9 @@ public class PersistentOffHeapStore implements AutoCloseable {
         }
 
         hitCount.incrementAndGet();
+        if (frequencySketch != null) {
+            frequencySketch.record(hash);
+        }
         return val;
     }
 
@@ -1759,6 +1820,116 @@ public class PersistentOffHeapStore implements AutoCloseable {
     }
 
     /**
+     * Caffeine 式 Window TinyLFU 门禁准入与频次偏向淘汰 (0 堆内存分配，无死锁)：
+     * 1. 在目标 Slab 中随机抽样 K=10 个有效占用槽位；
+     * 2. 若发现过期槽位，立即无条件淘汰并回收空间 (最高淘汰优先级)；
+     * 3. 否则估算各样本的访问频次 (0~15)，选出频次最低的牺牲者 (Victim)；同频次时以最久未访问 (LRU) 决胜负；
+     * 4. 门禁准入裁判 (TinyLFU Admission Gate)：
+     *    - 若 候选者频次 (Candidate) > 牺牲者频次 (Victim)：准入候选者，淘汰牺牲者！
+     *    - 若 候选者频次 < 牺牲者频次：
+     *      若牺牲者具备热度且候选者为冷门数据，拒绝准入并放弃淘汰，保护热点数据免受全表扫描污染；
+     *      提供 3% 随机探针窗口旁路 (Window Cache Bypass)，给予全新突发流量孵化机会，杜绝饥饿；
+     *    - 若频次相等：按 LRU 规则淘汰最久样本并准入候选者。
+     */
+    private boolean evictTinyLfuInSlab(int classIdx, long candidateHash) {
+        SlabClass slab = slabs[classIdx];
+        int cap = slab.capacity;
+        if (cap <= 0) return false;
+
+        MemorySegment seg = slab.segment;
+        long now = System.currentTimeMillis();
+        int maxProbes = Math.min(cap, 32);
+        int targetSamples = Math.min(10, cap);
+        var rng = java.util.concurrent.ThreadLocalRandom.current();
+
+        int candidateFreq = (frequencySketch != null) ? frequencySketch.estimate(candidateHash) : 0;
+
+        for (int attempt = 0; attempt < 3; attempt++) {
+            int victimSlot = -1;
+            int victimFreq = Integer.MAX_VALUE;
+            long victimLastAccess = Long.MAX_VALUE;
+            long victimHash = 0L;
+            int validSampled = 0;
+
+            for (int i = 0; i < maxProbes && validSampled < targetSamples; i++) {
+                int slot = rng.nextInt(cap);
+                long base = slab.getOffset(slot);
+                int magic = seg.get(ValueLayout.JAVA_INT, base + OFF_MAGIC);
+                if (magic != MAGIC_HEADER) continue;
+
+                validSampled++;
+                long expireAt = seg.get(ValueLayout.JAVA_LONG, base + OFF_EXPIRE_AT);
+                if (expireAt > 0 && now > expireAt) {
+                    // 已过期条目拥有绝对最高淘汰优先级，无视门禁立即淘汰！
+                    victimSlot = slot;
+                    victimHash = seg.get(ValueLayout.JAVA_LONG, base + OFF_HASH);
+                    victimFreq = -1;
+                    break;
+                }
+
+                long h = seg.get(ValueLayout.JAVA_LONG, base + OFF_HASH);
+                int freq = (frequencySketch != null) ? frequencySketch.estimate(h) : 0;
+                long lastAccess = seg.get(ValueLayout.JAVA_LONG, base + OFF_LAST_ACCESS);
+
+                if (victimSlot == -1 || freq < victimFreq || (freq == victimFreq && lastAccess < victimLastAccess)) {
+                    victimSlot = slot;
+                    victimFreq = freq;
+                    victimLastAccess = lastAccess;
+                    victimHash = h;
+                }
+            }
+
+            if (victimSlot < 0) {
+                return false;
+            }
+
+            // 门禁准入判定 (Admission Gate)
+            if (victimFreq >= 0) { // 非过期项才需经门禁裁判
+                if (candidateFreq < victimFreq) {
+                    // 若牺牲者是已建立频次的热点数据 (victimFreq >= 2)，而候选者频次较低：
+                    // 严格拦截，保护热点免遭全表扫描污染！
+                    if (victimFreq >= 2) {
+                        return false;
+                    }
+                    // 若牺牲者本身也只是冷数据 (victimFreq <= 1)，提供 10% 准入置换概率给全新热点孵化
+                    if (rng.nextInt(10) != 0) {
+                        return false;
+                    }
+                }
+            }
+
+            int b = (int) (victimHash & bucketMask);
+            int stripe = b & stripeMask;
+            var lock = locks[stripe].writeLock();
+            if (lock.tryLock()) {
+                try {
+                    long curr = indexSegment.getAtIndex(ValueLayout.JAVA_LONG, b);
+                    long prev = -1L;
+                    while (curr != -1L) {
+                        if (decodeClassIdx(curr) == classIdx && decodeSlotIdx(curr) == victimSlot) {
+                            long next = getNextHandle(curr);
+                            if (prev == -1L) {
+                                indexSegment.setAtIndex(ValueLayout.JAVA_LONG, b, next);
+                            } else {
+                                setNextHandle(prev, next);
+                            }
+                            freeHandle(curr);
+                            entryCount.decrementAndGet();
+                            evictionCount.incrementAndGet();
+                            return true;
+                        }
+                        prev = curr;
+                        curr = getNextHandle(curr);
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * Redis 式 K-Sample 随机采样 O(1) 近似 LRU 淘汰 (0 堆内存分配，无死锁)：
      * 1. 在目标 Slab 中随机抽样 K=8 个有效占用槽位，比较其 OFF_LAST_ACCESS 时间戳；
      * 2. 优先淘汰已过期槽位，否则精准选中 K 个样本中最久未访问 (最小 lastAccess) 的槽位；
@@ -1909,6 +2080,14 @@ public class PersistentOffHeapStore implements AutoCloseable {
             array[i] = new SlabStat(s.classIdx, s.slotSize, s.capacity, alloc, capBytes, allocBytes, util);
         }
         return array;
+    }
+
+    public EvictionPolicy getEvictionPolicy() {
+        return evictionPolicy;
+    }
+
+    public OffHeapFrequencySketch getFrequencySketch() {
+        return frequencySketch;
     }
 
     public Stats getStats() {
