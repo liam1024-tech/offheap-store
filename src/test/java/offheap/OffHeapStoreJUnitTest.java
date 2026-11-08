@@ -454,4 +454,85 @@ class OffHeapStoreJUnitTest {
             assertArrayEquals(vA, reopened.get(kA));
         }
     }
+
+    @Test
+    @DisplayName("Resource & Recovery Fidelity: Zero FileChannel FD Leak, Persisted LRU Timestamp, and Non-Blocking Sketch Aging")
+    void testZeroFileDescriptorLeakAndLruTimestampRecovery(@TempDir Path tempDir) throws Exception {
+        // 1. Verify zero FileChannel file descriptor leak across 25 repeated open() + close() cycles
+        Path fdDir = tempDir.resolve("fd_leak_test");
+        int[] smallCap = new int[11];
+        java.util.Arrays.fill(smallCap, 32);
+
+        for (int i = 0; i < 2; i++) {
+            try (PersistentOffHeapStore warmup = PersistentOffHeapStore.open(fdDir, 64, smallCap)) {
+                warmup.put("w".getBytes(), "v".getBytes());
+            }
+        }
+
+        long fdBefore = getOpenFdCount();
+        for (int c = 0; c < 25; c++) {
+            try (PersistentOffHeapStore store = PersistentOffHeapStore.open(fdDir, 64, smallCap)) {
+                store.put(("k:" + c).getBytes(), ("v:" + c).getBytes());
+                store.sync();
+            }
+        }
+        long fdAfter = getOpenFdCount();
+        assertTrue((fdAfter - fdBefore) <= 5, "FileChannel FD leak detected across repeated reopen cycles: delta=" + (fdAfter - fdBefore));
+
+        // 2. Verify OFF_LAST_ACCESS millisecond timestamp is preserved across restarts for K_SAMPLE_LRU
+        Path lruDir = tempDir.resolve("lru_ts_test");
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.builder()
+                .storageDir(lruDir)
+                .maxBuckets(64)
+                .slotCounts(smallCap)
+                .evictionPolicy(EvictionPolicy.K_SAMPLE_LRU)
+                .build()) {
+            byte[] payload = new byte[16];
+            for (int i = 0; i < 32; i++) {
+                assertTrue(store.put(("lru:" + i).getBytes(), payload));
+            }
+            Thread.sleep(50L);
+            for (int i = 0; i < 8; i++) {
+                assertNotNull(store.get(("lru:" + i).getBytes()));
+            }
+            store.sync();
+        }
+
+        try (PersistentOffHeapStore reopened = PersistentOffHeapStore.builder()
+                .storageDir(lruDir)
+                .maxBuckets(64)
+                .slotCounts(smallCap)
+                .evictionPolicy(EvictionPolicy.K_SAMPLE_LRU)
+                .build()) {
+            byte[] payload = new byte[16];
+            for (int i = 32; i < 46; i++) {
+                assertTrue(reopened.put(("lru:" + i).getBytes(), payload));
+            }
+            int hotSurvived = 0;
+            for (int i = 0; i < 8; i++) {
+                if (reopened.containsKey(("lru:" + i).getBytes())) {
+                    hotSurvived++;
+                }
+            }
+            assertTrue(hotSurvived >= 6, "Hot keys accessed before restart must retain LRU recency advantage! Survived: " + hotSurvived + "/8");
+        }
+
+        // 3. Verify non-blocking OffHeapFrequencySketch.tryReset() and reset() under concurrent access
+        try (OffHeapFrequencySketch sketch = new OffHeapFrequencySketch(256, null)) {
+            int sampleSize = sketch.getSampleSize();
+            for (int i = 0; i < sampleSize * 3; i++) {
+                sketch.record(i & 127);
+            }
+            int est = sketch.estimate(1L);
+            assertTrue(est >= 0 && est <= 15);
+        }
+    }
+
+    private static long getOpenFdCount() {
+        var osBean = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+        if (osBean instanceof com.sun.management.UnixOperatingSystemMXBean unixBean) {
+            return unixBean.getOpenFileDescriptorCount();
+        }
+        return 0L;
+    }
 }

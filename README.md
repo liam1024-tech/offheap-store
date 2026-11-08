@@ -88,12 +88,9 @@ Off-Heap Store has **zero third-party dependencies**. You only need a modern JDK
 git clone https://github.com/liam1024-tech/offheap-store.git
 cd offheap-store
 
-# Build jar and test suite
+# Build jar and run all 6 standalone battle & chaos test suites
 chmod +x build.sh
-./build.sh
-
-# Run the 10 Extreme Battle Tests
-java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest
+./build.sh --test
 ```
 
 ### 2. Maven Configuration
@@ -105,7 +102,7 @@ Add the JVM flag `--enable-native-access=ALL-UNNAMED` to allow Java FFM access w
     <dependency>
         <groupId>io.github.liam1024-tech</groupId>
         <artifactId>offheap-store</artifactId>
-        <version>1.2.3</version>
+        <version>1.2.4</version>
     </dependency>
 </dependencies>
 ```

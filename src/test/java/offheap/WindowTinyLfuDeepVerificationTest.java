@@ -35,9 +35,10 @@ public class WindowTinyLfuDeepVerificationTest {
         testExpiredKeyImmediateEviction();
         testHitRateComparisonZipfianWithScans();
         testConcurrentMultiThreadStress();
+        testNonBlockingConcurrentAgingReset();
 
         System.out.println("\n================================================================================");
-        System.out.println("  🎉 ALL 7 WINDOW TINY-LFU DEEP VERIFICATION TESTS PASSED WITH 100% SUCCESS! 🎉");
+        System.out.println("  🎉 ALL 8 WINDOW TINY-LFU DEEP VERIFICATION TESTS PASSED WITH 100% SUCCESS! 🎉");
         System.out.println("================================================================================\n");
     }
 
@@ -45,7 +46,7 @@ public class WindowTinyLfuDeepVerificationTest {
      * 测试 1: 4-bit 饱和计数器上限隔离
      */
     private static void test4BitCounterSaturation() {
-        System.out.print("[Test 1/7] 4-bit 饱和计数器上限验证 (0..15 绝不溢出) ... ");
+        System.out.print("[Test 1/8] 4-bit 饱和计数器上限验证 (0..15 绝不溢出) ... ");
         try (OffHeapFrequencySketch sketch = new OffHeapFrequencySketch(1024, null)) {
             long testHash = 0x123456789ABCDEFL;
 
@@ -77,7 +78,7 @@ public class WindowTinyLfuDeepVerificationTest {
      * 测试 2: 硬件单周期并行半衰衰减 (Aging / Decay) 精度
      */
     private static void testBitwiseHalvingDecay() {
-        System.out.print("[Test 2/7] 硬件级位运算半衰衰减 (Aging: 15->7->3->1->0) ... ");
+        System.out.print("[Test 2/8] 硬件级位运算半衰衰减 (Aging: 15->7->3->1->0) ... ");
         try (OffHeapFrequencySketch sketch = new OffHeapFrequencySketch(1024, null)) {
             long testHash = 0xCAFEBABEDEADBEEFL;
 
@@ -139,7 +140,7 @@ public class WindowTinyLfuDeepVerificationTest {
      * 测试 3: 准入门禁防御性拦截 (Cold 一击即走数据 0% 侵入率)
      */
     private static void testAdmissionGateScanDefense() throws Exception {
-        System.out.print("[Test 3/7] 准入门禁拦截全表冷扫描 (500/500 热键 100% 留存) ... ");
+        System.out.print("[Test 3/8] 准入门禁拦截全表冷扫描 (500/500 热键 100% 留存) ... ");
         int[] slotCounts = new int[11];
         Arrays.fill(slotCounts, 500);
 
@@ -186,7 +187,7 @@ public class WindowTinyLfuDeepVerificationTest {
      * 测试 4: 准入门禁晋升机制 (真热点 Candidate 成功淘汰冷门 Victim)
      */
     private static void testHotCandidateAdmission() throws Exception {
-        System.out.print("[Test 4/7] 准入门禁晋升机制 (高频 Candidate 成功置换冷门槽位) ... ");
+        System.out.print("[Test 4/8] 准入门禁晋升机制 (高频 Candidate 成功置换冷门槽位) ... ");
         int[] slotCounts = new int[11];
         Arrays.fill(slotCounts, 100);
 
@@ -226,7 +227,7 @@ public class WindowTinyLfuDeepVerificationTest {
      * 测试 5: 过期键优先级最高准则 (过期项立即淘汰无需门禁阻拦)
      */
     private static void testExpiredKeyImmediateEviction() throws Exception {
-        System.out.print("[Test 5/7] 过期槽位最高优先级淘汰验证 (无视历史频次立即回收) ... ");
+        System.out.print("[Test 5/8] 过期槽位最高优先级淘汰验证 (无视历史频次立即回收) ... ");
         int[] slotCounts = new int[11];
         Arrays.fill(slotCounts, 50);
 
@@ -274,7 +275,7 @@ public class WindowTinyLfuDeepVerificationTest {
      * 测试 6: 真实 Zipfian 倾斜工作负载 + 全表扫描冲击下的命中率对比测试
      */
     private static void testHitRateComparisonZipfianWithScans() throws Exception {
-        System.out.print("[Test 6/7] 真实 Zipfian + 扫描场景下的命中率对决 (TinyLFU vs LRU) ... \n");
+        System.out.print("[Test 6/8] 真实 Zipfian + 扫描场景下的命中率对决 (TinyLFU vs LRU) ... \n");
 
         int capacity = 500;
         int totalDistinctKeys = 5_000;
@@ -353,7 +354,7 @@ public class WindowTinyLfuDeepVerificationTest {
      * 测试 7: 多线程高并发风暴安全性测试
      */
     private static void testConcurrentMultiThreadStress() throws Exception {
-        System.out.print("[Test 7/7] 多线程极限并发风暴验证 (8 线程 × 50,000 Ops 零死锁零损坏) ... ");
+        System.out.print("[Test 7/8] 多线程极限并发风暴验证 (8 线程 × 50,000 Ops 零死锁零损坏) ... ");
 
         int workers = 8;
         int opsPerWorker = 50_000;
@@ -413,6 +414,48 @@ public class WindowTinyLfuDeepVerificationTest {
             PersistentOffHeapStore.Stats stats = store.getStats();
             if (stats.hits() + stats.misses() == 0) {
                 throw new AssertionError("No reads tracked in stats!");
+            }
+        }
+        System.out.println("PASSED!");
+    }
+
+    /**
+     * 测试 8: 高并发非阻塞 CAS 频次衰减验证 (Non-Blocking tryReset & CAS Halving)
+     */
+    private static void testNonBlockingConcurrentAgingReset() throws Exception {
+        System.out.print("[Test 8/8] 高并发非阻塞 CAS 频次衰减验证 (AtomicBoolean tryReset 零阻塞) ... ");
+        try (OffHeapFrequencySketch sketch = new OffHeapFrequencySketch(512, null)) {
+            int workers = 8;
+            int opsPerWorker = 25_000;
+            ExecutorService pool = Executors.newFixedThreadPool(workers);
+            CountDownLatch latch = new CountDownLatch(workers);
+            AtomicInteger errors = new AtomicInteger(0);
+
+            for (int w = 0; w < workers; w++) {
+                final int wid = w;
+                pool.submit(() -> {
+                    try {
+                        for (int i = 0; i < opsPerWorker; i++) {
+                            long h = (wid * 1_000_000L) + (i & 255);
+                            sketch.record(h);
+                            int est = sketch.estimate(h);
+                            if (est < 0 || est > 15) {
+                                throw new AssertionError("Invalid 4-bit counter estimate: " + est);
+                            }
+                        }
+                    } catch (Throwable t) {
+                        errors.incrementAndGet();
+                        t.printStackTrace();
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+
+            boolean done = latch.await(15, TimeUnit.SECONDS);
+            pool.shutdown();
+            if (!done || errors.get() > 0) {
+                throw new AssertionError("Non-blocking concurrent aging reset failed!");
             }
         }
         System.out.println("PASSED!");

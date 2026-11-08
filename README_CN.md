@@ -87,12 +87,9 @@ flowchart TD
 git clone https://github.com/liam1024-tech/offheap-store.git
 cd offheap-store
 
-# 一键编译并打包 Jar
+# 一键编译打包并运行全部 6 大独立压测与混沌自愈测试套件
 chmod +x build.sh
-./build.sh
-
-# 运行 10 大极限对抗验证套件
-java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest
+./build.sh --test
 ```
 
 ---

@@ -117,8 +117,57 @@ public class PersistentRecoveryTest {
             System.out.println("  ✔ 二次重启增量写入与删除 100% 吻合！");
         }
 
+        // =====================================================================
+        // 阶段 5: 跨重启 OFF_LAST_ACCESS 时间戳保真与 LRU 热点留存验证
+        // =====================================================================
+        System.out.println("\n [阶段 5] 跨重启 OFF_LAST_ACCESS 毫秒时间戳保真与采样 LRU 热点留存验证 ...");
+        Path lruDir = testDir.resolve("lru_timestamp_preservation");
+        Files.createDirectories(lruDir);
+        int[] smallCap = new int[11];
+        Arrays.fill(smallCap, 50);
+
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.builder()
+                .storageDir(lruDir)
+                .maxBuckets(128)
+                .slotCounts(smallCap)
+                .evictionPolicy(EvictionPolicy.K_SAMPLE_LRU)
+                .build()) {
+            byte[] payload = new byte[16];
+            for (int i = 0; i < 50; i++) {
+                assert store.put(("lru:persist:" + i).getBytes(StandardCharsets.UTF_8), payload);
+            }
+            // 拉开冷热数据的时间戳差距 (60ms)，仅高频访问前 10 个热点键
+            Thread.sleep(60);
+            for (int i = 0; i < 10; i++) {
+                assert store.get(("lru:persist:" + i).getBytes(StandardCharsets.UTF_8)) != null;
+            }
+            store.sync();
+        }
+
+        // 重启挂载后，不再次访问前 10 个热点键，直接写入 20 个新键触发 K_SAMPLE_LRU 淘汰：
+        // 若 recoverAndRebuild 正确保留了磁盘上的毫秒级 OFF_LAST_ACCESS（而非用 System.nanoTime() 覆盖），前 10 个热点键应几乎全部存活！
+        try (PersistentOffHeapStore reopened = PersistentOffHeapStore.builder()
+                .storageDir(lruDir)
+                .maxBuckets(128)
+                .slotCounts(smallCap)
+                .evictionPolicy(EvictionPolicy.K_SAMPLE_LRU)
+                .build()) {
+            byte[] payload = new byte[16];
+            for (int i = 50; i < 70; i++) {
+                assert reopened.put(("lru:persist:" + i).getBytes(StandardCharsets.UTF_8), payload);
+            }
+            int hotSurvived = 0;
+            for (int i = 0; i < 10; i++) {
+                if (reopened.containsKey(("lru:persist:" + i).getBytes(StandardCharsets.UTF_8))) {
+                    hotSurvived++;
+                }
+            }
+            System.out.printf("  ✔ 重启后触发 20 次 K_SAMPLE_LRU 淘汰，重启前访问的热点键存活: %d/10 (时间戳跨重启 100%% 保真)\n", hotSurvived);
+            assert hotSurvived >= 8 : "Persisted OFF_LAST_ACCESS timestamp was not preserved across restart! Survived: " + hotSurvived + "/10";
+        }
+
         System.out.println("\n================================================================================");
-        System.out.println("   🏆 PersistentOffHeapStore 重启不丢失测试 100% 全部通过！ 🏆");
+        System.out.println("   🏆 PersistentOffHeapStore 全部 5 阶段重启不丢失与状态保真测试 100% 通过！ 🏆");
         System.out.println("================================================================================");
     }
 }

@@ -190,13 +190,19 @@ public class ContinuousSoakStressEngine {
                             store.getAndSet(k, nextVal);
                             totalWrites.incrementAndGet();
                         } else {
-                            // 1% BatchPut (多键死锁免疫批量写入)
+                            // 1% BatchPut + BatchGet + removeIfExpired (多键死锁免疫批量读写与过期条件清理)
                             Map<byte[], byte[]> batch = new HashMap<>(4);
+                            List<byte[]> queryKeys = new ArrayList<>(4);
                             for (int b = 0; b < 4; b++) {
-                                batch.put(keyPool[rng.nextInt(keySpace)], payloadPool[rng.nextInt(payloadPool.length)]);
+                                byte[] bk = keyPool[rng.nextInt(keySpace)];
+                                batch.put(bk, payloadPool[rng.nextInt(payloadPool.length)]);
+                                queryKeys.add(bk);
                             }
                             store.batchPut(batch);
+                            store.batchGet(queryKeys);
+                            store.removeIfExpired(k);
                             totalWrites.incrementAndGet();
+                            totalReads.incrementAndGet();
                         }
 
                         long elapsedNs = System.nanoTime() - t0;
@@ -220,6 +226,8 @@ public class ContinuousSoakStressEngine {
                 shutdownLatch.countDown();
             });
         }
+
+        final long initialFdCount = getOpenFdCount();
 
         // 2. 启动周期性服务崩溃重启与持久化不丢失验证线程 (Crash & Instant Recovery Simulator)
         Thread restartSimulator = new Thread(() -> {
@@ -279,11 +287,19 @@ public class ContinuousSoakStressEngine {
                         }
                     }
 
+                    // 4. 校验重挂载后文件描述符 (FD) 是否存在泄漏
+                    long currentFds = getOpenFdCount();
+                    if (initialFdCount > 0 && (currentFds - initialFdCount) > 32) {
+                        anomaliesDetected.incrementAndGet();
+                        logEdgeCase(edgeCaseLog, "CrashSimulator", "FD_LEAK_DETECTED",
+                                "Open FD count grew from " + initialFdCount + " to " + currentFds, null);
+                    }
+
                     totalRestarts.incrementAndGet();
                     long totalRestartCostMs = System.currentTimeMillis() - restartStart;
 
-                    System.out.printf("  [🔄 崩溃重启模拟 #%d] 瞬时预热挂载耗时: %d ms | 校验哨兵键: %d/%d (100%% 零丢失) | 总恢复用时: %d ms\n",
-                            totalRestarts.get(), reopenCostMs, verified, canaryMap.size(), totalRestartCostMs);
+                    System.out.printf("  [🔄 崩溃重启模拟 #%d] 瞬时预热挂载耗时: %d ms | 校验哨兵键: %d/%d (100%% 零丢失) | 打开 FD: %d | 总恢复用时: %d ms\n",
+                            totalRestarts.get(), reopenCostMs, verified, canaryMap.size(), currentFds, totalRestartCostMs);
 
                 } catch (Throwable e) {
                     anomaliesDetected.incrementAndGet();
@@ -330,7 +346,7 @@ public class ContinuousSoakStressEngine {
         for (var b : gcBeans) gcTimeBaseline += b.getCollectionTime();
 
         try (PrintWriter logWriter = new PrintWriter(new FileWriter(logFile.toFile(), true))) {
-            logWriter.println("TIMESTAMP | ELAPSED_S | TOTAL_OPS | OPS_PER_SEC | P50_US | P99_US | P999_US | HIT_RATE_% | HITS | MISSES | EVICTIONS | ADMISSION_REJECTIONS | ACTIVE_KEYS | OFFHEAP_MB | RESTARTS | ANOMALIES | GC_TIME_MS");
+            logWriter.println("TIMESTAMP | ELAPSED_S | TOTAL_OPS | OPS_PER_SEC | P50_US | P99_US | P999_US | HIT_RATE_% | HITS | MISSES | EVICTIONS | ADMISSION_REJECTIONS | ACTIVE_KEYS | OFFHEAP_MB | RESTARTS | ANOMALIES | OPEN_FDS | GC_TIME_MS");
 
             while (System.currentTimeMillis() < deadline) {
                 Thread.sleep(5000); // 每 5 秒输出一次全景监控快照
@@ -368,20 +384,21 @@ public class ContinuousSoakStressEngine {
                 PersistentOffHeapStore.Stats stats = store.getStats();
                 long elapsedSec = (System.currentTimeMillis() - startWallTime) / 1000;
                 String timeStr = LocalDateTime.now().format(TIME_FMT);
+                long openFds = getOpenFdCount();
 
-                String report = String.format("[%s] 运行: %4ds | 总操作: %,10d | 吞吐: %,7d ops/s | P50: %5.1fμs | P99: %6.1fμs | 命中率: %5.2f%% (命中: %,d / 未命中: %,d) | 存活键: %,6d | 驱逐: %,d | 门禁拦截: %,d | 堆外占用: %4d MB | 重启轮次: %2d | 异常/泄漏: %d | GC停顿: %d ms",
+                String report = String.format("[%s] 运行: %4ds | 总操作: %,10d | 吞吐: %,7d ops/s | P50: %5.1fμs | P99: %6.1fμs | 命中率: %5.2f%% (命中: %,d / 未命中: %,d) | 存活键: %,6d | 驱逐: %,d | 门禁拦截: %,d | 堆外占用: %4d MB | 重启轮次: %2d | 异常/泄漏: %d | FD: %d | GC停顿: %d ms",
                         timeStr, elapsedSec, currentOps, throughput, p50, p99,
                         stats.hitRate(), stats.hits(), stats.misses(),
                         stats.activeEntries(), stats.evictions(), stats.admissionRejections(),
                         stats.allocatedBytes() / 1024 / 1024,
-                        totalRestarts.get(), anomaliesDetected.get(), deltaGcTime);
+                        totalRestarts.get(), anomaliesDetected.get(), openFds, deltaGcTime);
 
                 System.out.println(report);
-                logWriter.printf("%s | %d | %d | %d | %.2f | %.2f | %.2f | %.2f | %d | %d | %d | %d | %d | %d | %d | %d | %d\n",
+                logWriter.printf("%s | %d | %d | %d | %.2f | %.2f | %.2f | %.2f | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d\n",
                         timeStr, elapsedSec, currentOps, throughput, p50, p99, p999,
                         stats.hitRate(), stats.hits(), stats.misses(), stats.evictions(), stats.admissionRejections(),
                         stats.activeEntries(), stats.allocatedBytes() / 1024 / 1024,
-                        totalRestarts.get(), anomaliesDetected.get(), deltaGcTime);
+                        totalRestarts.get(), anomaliesDetected.get(), openFds, deltaGcTime);
                 logWriter.flush();
             }
         } finally {
@@ -400,6 +417,14 @@ public class ContinuousSoakStressEngine {
         System.out.println("   详细监控日志已输出至 : " + logFile);
         System.out.println("   边缘异常归档日志位于 : " + edgeCaseLog);
         System.out.println("================================================================================");
+    }
+
+    private static long getOpenFdCount() {
+        var osBean = ManagementFactory.getOperatingSystemMXBean();
+        if (osBean instanceof com.sun.management.UnixOperatingSystemMXBean unixBean) {
+            return unixBean.getOpenFileDescriptorCount();
+        }
+        return 0L;
     }
 
     private static synchronized void logEdgeCase(Path logPath, String component, String category, String details, Throwable t) {

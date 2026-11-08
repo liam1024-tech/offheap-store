@@ -30,9 +30,10 @@ public class PersistentConcurrencyRaceTest {
         testTtlReadOverwriteRace();
         testConcurrentSyncAndChurn();
         testAll11SlabClassesDynamicChurn();
+        testSameBucketCollisionResizeAndEvictionRace();
 
         System.out.println("\n================================================================================");
-        System.out.println("   🏆 所有并发深度竞态与全阶变压测 100% 全部通过！ 🏆");
+        System.out.println("   🏆 所有 4 大维度并发深度竞态与全阶变压测 100% 全部通过！ 🏆");
         System.out.println("================================================================================");
     }
 
@@ -50,28 +51,30 @@ public class PersistentConcurrencyRaceTest {
     /**
      * 竞态验证 1: TTL 读取过期与并发覆写竞态 (removeIfExpired 防误删)
      * 场景：Thread 1 读取到刚好过期的条目准备执行清理；在此瞬间 Thread 2 抢先写入了全新有效值。
-     * 验证：removeIfExpired 绝不误删 Thread 2 的新鲜有效数据！
+     * 验证：PersistentOffHeapStore 与 OffHeapStore 的 removeIfExpired 绝不误删 Thread 2 的新鲜有效数据！
      */
     private static void testTtlReadOverwriteRace() throws Exception {
-        System.out.println("\n[竞态验证 1] TTL 读取过期与并发覆写竞态 (removeIfExpired 防误删) ...");
+        System.out.println("\n[竞态验证 1] TTL 读取过期与并发覆写竞态 (双引擎 removeIfExpired 防误删) ...");
         cleanDir(TEST_DIR);
 
-        try (PersistentOffHeapStore store = PersistentOffHeapStore.open(TEST_DIR)) {
+        try (PersistentOffHeapStore store = PersistentOffHeapStore.open(TEST_DIR);
+             OffHeapStore memStore = OffHeapStore.inMemory(1024)) {
             int keyCount = 200;
             // 写入 200 个 100ms 短命条目
             for (int i = 0; i < keyCount; i++) {
                 byte[] k = ("race:key:" + i).getBytes(StandardCharsets.UTF_8);
                 byte[] v = ("initial_short_ttl_val_" + i).getBytes(StandardCharsets.UTF_8);
                 store.put(k, v, 100);
+                memStore.put(k, v, 100);
             }
 
             // 等待刚好过期
             Thread.sleep(120);
 
-            // 启动两个线程高并发交叉争用：一个线程执行 get() (内部触发过期清理)，另一个线程高频 put() 写入永久新值
-            ExecutorService pool = Executors.newFixedThreadPool(4);
+            // 启动线程池高并发交叉争用：执行 get()/batchGet() (内部触发 removeIfExpired) 与高频 put() 写入永久新值
+            ExecutorService pool = Executors.newFixedThreadPool(8);
             AtomicInteger putSuccess = new AtomicInteger(0);
-            CountDownLatch latch = new CountDownLatch(keyCount * 2);
+            CountDownLatch latch = new CountDownLatch(keyCount * 4);
 
             for (int i = 0; i < keyCount; i++) {
                 final int idx = i;
@@ -89,21 +92,35 @@ public class PersistentConcurrencyRaceTest {
                     }
                     latch.countDown();
                 });
+
+                pool.submit(() -> {
+                    memStore.get(k); // 触发 OffHeapStore.removeIfExpired
+                    latch.countDown();
+                });
+
+                pool.submit(() -> {
+                    memStore.put(k, freshVal, 0L);
+                    latch.countDown();
+                });
             }
 
-            latch.await(5, TimeUnit.SECONDS);
+            latch.await(10, TimeUnit.SECONDS);
             pool.shutdown();
 
-            // 最终核查：任何 putSuccess 的键必须 100% 存在且内容正确，绝不允许被迟到的过期清理误删！
+            // 最终核查：任何写入成功的永久键必须 100% 存在且内容正确，绝不允许被迟到的过期清理误删！
             for (int i = 0; i < keyCount; i++) {
                 byte[] k = ("race:key:" + i).getBytes(StandardCharsets.UTF_8);
-                byte[] actual = store.get(k);
-                if (actual != null) {
-                    byte[] expected = ("fresh_permanent_val_" + i).getBytes(StandardCharsets.UTF_8);
-                    assert Arrays.equals(actual, expected) : "Fresh value was corrupted for key " + i;
-                }
+                byte[] expected = ("fresh_permanent_val_" + i).getBytes(StandardCharsets.UTF_8);
+
+                byte[] actualP = store.get(k);
+                assert actualP != null && Arrays.equals(actualP, expected)
+                        : "PersistentOffHeapStore fresh value was lost or corrupted for key " + i;
+
+                byte[] actualM = memStore.get(k);
+                assert actualM != null && Arrays.equals(actualM, expected)
+                        : "OffHeapStore fresh value was lost or corrupted for key " + i;
             }
-            System.out.println("  ✔ removeIfExpired 条件删除生效：并发覆写的新鲜值 100% 完好无损，0 误删！");
+            System.out.println("  ✔ 双引擎 removeIfExpired 条件删除生效：并发覆写的新鲜值 100% 完好无损，0 误删！");
         }
     }
 
@@ -218,6 +235,87 @@ public class PersistentConcurrencyRaceTest {
                 assert read[0] == (byte) ('A' + 10) : "Max slab content corrupted!";
             }
             System.out.println("  ✔ 重启挂载验证：最大阶 64KB 数据跨越冷启 100% 完整复活！");
+        }
+    }
+
+    /**
+     * 竞态验证 4: 极小桶数 (4 桶) 与极小槽位 (16 槽/阶) 下的同桶冲突变长扩容、CAS 原地指纹升级与淘汰二次校验竞态
+     */
+    private static void testSameBucketCollisionResizeAndEvictionRace() throws Exception {
+        System.out.println("\n[竞态验证 4] 极小桶容量下高并发同桶变长覆写、CAS 指纹保真与淘汰防环竞态 ...");
+        cleanDir(TEST_DIR);
+
+        int[] tinySlots = new int[11];
+        Arrays.fill(tinySlots, 16);
+
+        try (PersistentOffHeapStore pStore = PersistentOffHeapStore.builder()
+                .storageDir(TEST_DIR)
+                .maxBuckets(4)
+                .slotCounts(tinySlots)
+                .evictionPolicy(EvictionPolicy.WINDOW_TINY_LFU)
+                .build();
+             OffHeapStore mStore = new OffHeapStore(4, tinySlots, EvictionPolicy.WINDOW_TINY_LFU)) {
+
+            int workers = 8;
+            int opsPerWorker = 2_500;
+            ExecutorService pool = Executors.newFixedThreadPool(workers);
+            CountDownLatch latch = new CountDownLatch(workers);
+            AtomicInteger errors = new AtomicInteger(0);
+
+            byte[] vSmall = "small_payload_16".getBytes(StandardCharsets.UTF_8);
+            byte[] vMid = new byte[180];
+            Arrays.fill(vMid, (byte) 'M');
+
+            for (int w = 0; w < workers; w++) {
+                final int wid = w;
+                pool.submit(() -> {
+                    try {
+                        ThreadLocalRandom rng = ThreadLocalRandom.current();
+                        for (int i = 0; i < opsPerWorker; i++) {
+                            byte[] k = ("collision:race:" + rng.nextInt(80)).getBytes(StandardCharsets.UTF_8);
+                            int op = rng.nextInt(5);
+                            if (op == 0) {
+                                pStore.put(k, vSmall);
+                                mStore.put(k, vSmall);
+                            } else if (op == 1) {
+                                pStore.put(k, vMid);
+                                mStore.put(k, vMid);
+                            } else if (op == 2) {
+                                pStore.compareAndSwap(k, vSmall, vMid);
+                                mStore.compareAndSwap(k, vSmall, vMid);
+                            } else if (op == 3) {
+                                pStore.getAndSet(k, vSmall);
+                                mStore.getAndSet(k, vSmall);
+                            } else {
+                                pStore.get(k);
+                                mStore.get(k);
+                            }
+                        }
+                    } catch (Throwable t) {
+                        errors.incrementAndGet();
+                        t.printStackTrace();
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+
+            boolean done = latch.await(15, TimeUnit.SECONDS);
+            pool.shutdown();
+            assert done : "Deadlock or infinite cycle detected during collision resize & eviction race!";
+            assert errors.get() == 0 : "Encountered " + errors.get() + " errors during collision resize & eviction race!";
+            pStore.sync();
+        }
+
+        // 重启挂载验证磁盘中无任何环形链或孤儿泄漏
+        try (PersistentOffHeapStore reopened = PersistentOffHeapStore.builder()
+                .storageDir(TEST_DIR)
+                .maxBuckets(4)
+                .slotCounts(tinySlots)
+                .evictionPolicy(EvictionPolicy.WINDOW_TINY_LFU)
+                .build()) {
+            assert reopened.size() >= 0 && reopened.size() <= 16 * 11;
+            System.out.println("  ✔ 同桶变长扩容、CAS 指纹保真与淘汰锁二次校验 100% 通过，冷启 0 环路！");
         }
     }
 }

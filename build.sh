@@ -39,11 +39,28 @@ TEST_SOURCES=$(ls src/test/java/offheap/*.java | grep -v "JUnit" || true)
 echo -e "\n========================================================"
 echo "  Build SUCCESS! All components compiled without errors."
 echo "========================================================"
-echo -e "\nTo run the 10 Extreme Battle Tests directly:"
-echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest"
-echo -e "\nTo run Dual Mode Verification:"
-echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.DualModeStorageTest"
-echo -e "\nTo run Window TinyLFU Deep Verification Suite:"
-echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.WindowTinyLfuDeepVerificationTest"
-echo -e "\nTo start 7-Day Continuous Soak Engine:"
-echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -Xms2g -Xmx2g -XX:+UseZGC -cp target/classes:target/test-classes offheap.ContinuousSoakStressEngine --duration-minutes 10080 --workers 8 --policy TINY_LFU"
+
+if [[ "${1:-}" == "--test" || "${1:-}" == "--run-tests" ]]; then
+  echo -e "\n>>> Executing Full Standalone Verification Suite (6 Suites) <<<"
+  "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest
+  "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.DualModeStorageTest
+  "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.WindowTinyLfuDeepVerificationTest
+  "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentChaosTest
+  "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentConcurrencyRaceTest
+  "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentRecoveryTest
+  echo -e "\n========================================================"
+  echo "  ALL 6 STANDALONE TEST SUITES PASSED 100%!"
+  echo "========================================================"
+else
+  echo -e "\nTo run all 6 standalone test suites at once:"
+  echo "  ./build.sh --test"
+  echo -e "\nOr run individual suites directly:"
+  echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest"
+  echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.DualModeStorageTest"
+  echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.WindowTinyLfuDeepVerificationTest"
+  echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentChaosTest"
+  echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentConcurrencyRaceTest"
+  echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentRecoveryTest"
+  echo -e "\nTo start 7-Day Continuous Soak Engine:"
+  echo "  $JAVA --enable-native-access=ALL-UNNAMED -ea -Xms2g -Xmx2g -XX:+UseZGC -cp target/classes:target/test-classes offheap.ContinuousSoakStressEngine --duration-minutes 10080 --workers 8 --policy TINY_LFU"
+fi

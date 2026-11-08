@@ -43,5 +43,17 @@ jobs:
       run: |
         java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.WindowTinyLfuDeepVerificationTest
 
+    - name: Run Persistent Chaos & Self-Healing Suite (8 Scenarios)
+      run: |
+        java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentChaosTest
+
+    - name: Run Concurrency Race & Dynamic Slab Churn Suite (4 Scenarios)
+      run: |
+        java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentConcurrencyRaceTest
+
+    - name: Run Persistent Crash Recovery & Timestamp Fidelity Suite (5 Stages)
+      run: |
+        java --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentRecoveryTest
+
     - name: Run Maven JUnit Tests
       run: mvn test
