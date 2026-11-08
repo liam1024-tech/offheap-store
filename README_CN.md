@@ -233,6 +233,11 @@ public class DemoWindowTinyLfu {
 
             // 核心热数据 100% 留存，完全免疫全表扫描洗劫
             System.out.println("热点数据是否存活: " + cache.containsKey(hotKey));
+
+            // 实时获取缓存命中率与门禁拦截指标
+            PersistentOffHeapStore.Stats stats = cache.getStats();
+            System.out.printf("命中率: %.2f%% | 命中: %d | 未命中: %d | 驱逐: %d | 门禁拦截: %d\n",
+                    stats.hitRate(), stats.hits(), stats.misses(), stats.evictions(), stats.admissionRejections());
         }
     }
 }

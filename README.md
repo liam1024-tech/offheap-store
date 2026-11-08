@@ -249,6 +249,11 @@ public class ExampleWindowTinyLfu {
 
             // Hot key remains safe with 100% survival rate
             System.out.println("Hot key preserved: " + cache.containsKey(hotKey));
+
+            // Access real-time cache statistics including hit rate and TinyLFU admission rejections
+            PersistentOffHeapStore.Stats stats = cache.getStats();
+            System.out.printf("Hit Rate: %.2f%% | Hits: %d | Misses: %d | Evictions: %d | Admission Rejections: %d\n",
+                    stats.hitRate(), stats.hits(), stats.misses(), stats.evictions(), stats.admissionRejections());
         }
     }
 }
