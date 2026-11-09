@@ -41,7 +41,8 @@ echo "  Build SUCCESS! All components compiled without errors."
 echo "========================================================"
 
 if [[ "${1:-}" == "--test" || "${1:-}" == "--run-tests" ]]; then
-  echo -e "\n>>> Executing Full Standalone Verification Suite (6 Suites) <<<"
+  echo -e "\n>>> Executing Full Standalone Verification Suite (7 Suites) <<<"
+  "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.CommunityExtremeEdgeCasesTest
   "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.AdvancedExtremeBattleTest
   "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.DualModeStorageTest
   "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.WindowTinyLfuDeepVerificationTest
@@ -49,7 +50,7 @@ if [[ "${1:-}" == "--test" || "${1:-}" == "--run-tests" ]]; then
   "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentConcurrencyRaceTest
   "$JAVA" --enable-native-access=ALL-UNNAMED -ea -cp target/classes:target/test-classes offheap.PersistentRecoveryTest
   echo -e "\n========================================================"
-  echo "  ALL 6 STANDALONE TEST SUITES PASSED 100%!"
+  echo "  ALL 7 STANDALONE TEST SUITES PASSED 100%!"
   echo "========================================================"
 else
   echo -e "\nTo run all 6 standalone test suites at once:"

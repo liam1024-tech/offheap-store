@@ -96,15 +96,28 @@ def parse_soak_log(window_samples=120):
     if not parsed_records:
         return None
 
-    # Entire history vs current window
-    window = parsed_records[-window_samples:] if len(parsed_records) >= window_samples else parsed_records
+    # Multi-session boundary detection (across VM resume / engine restarts)
+    sessions = []
+    curr = []
+    for r in parsed_records:
+        if curr and r["elapsed_s"] < curr[-1]["elapsed_s"]:
+            sessions.append(curr)
+            curr = []
+        curr.append(r)
+    if curr:
+        sessions.append(curr)
+
+    grand_total_ops = sum(s[-1]["total_ops"] for s in sessions)
+    grand_elapsed_s = sum(s[-1]["elapsed_s"] for s in sessions)
+    grand_restarts = sum(s[-1]["restarts"] for s in sessions)
+
+    current_session = sessions[-1]
+    window = current_session[-window_samples:] if len(current_session) >= window_samples else current_session
     first_w = window[0]
     last_w = window[-1]
 
-    # Calculate statistics across the window
-    ops_completed_in_window = last_w["total_ops"] - first_w["total_ops"]
-    window_duration_s = max(1, last_w["elapsed_s"] - first_w["elapsed_s"])
-    window_avg_ops_sec = ops_completed_in_window / window_duration_s
+    # Calculate statistics across the current active window
+    window_avg_ops_sec = sum(r["ops_per_sec"] for r in window) / len(window)
 
     p50_vals = [r["p50_us"] for r in window]
     p99_vals = [r["p99_us"] for r in window]
@@ -128,7 +141,9 @@ def parse_soak_log(window_samples=120):
 
     return {
         "all_records_count": len(parsed_records),
-        "total_elapsed_s": last_w["elapsed_s"],
+        "total_elapsed_s": grand_elapsed_s,
+        "current_run_elapsed_s": last_w["elapsed_s"],
+        "grand_total_ops": grand_total_ops,
         "total_ops": last_w["total_ops"],
         "current_ops_sec": last_w["ops_per_sec"],
         "window_avg_ops_sec": window_avg_ops_sec,
@@ -142,7 +157,8 @@ def parse_soak_log(window_samples=120):
         "hit_drift": hit_drift,
         "current_active_keys": last_w["active_keys"],
         "current_offheap_mb": last_w["offheap_mb"],
-        "total_restarts": last_w["restarts"],
+        "total_restarts": grand_restarts,
+        "current_restarts": last_w["restarts"],
         "total_anomalies": last_w["anomalies"],
         "open_fds": last_w["open_fds"],
         "gc_ms": last_w["gc_ms"],
@@ -185,7 +201,7 @@ def generate_report(metrics, telemetry, edge_cases, cycle_num=1):
 
 | 监控指标维度 | 当前实时值 | 10分钟窗口均值 / 统计 | 趋势与漂移评估 (Drift) | 健康基线要求 | 评级 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **累计处理操作数** | **{metrics['total_ops']:,} 次** | 窗口均速: **{metrics['window_avg_ops_sec']:,.0f} ops/s** | 稳定在 13~19 万 ops/s | > 100,000 ops/s | 🟢 卓越 |
+| **累计处理操作数** | **{metrics['grand_total_ops']:,} 次** (本轮: {metrics['total_ops']:,}) | 窗口均速: **{metrics['window_avg_ops_sec']:,.0f} ops/s** | 稳定在 13~19 万 ops/s | > 100,000 ops/s | 🟢 卓越 |
 | **P50 响应延迟** | **{metrics['latest']['p50_us']:.2f} μs** | 均值: **{metrics['avg_p50']:.2f} μs** (区间 {metrics['min_p50']:.2f}~{metrics['max_p50']:.2f}) | 漂移量: **{metrics['p50_drift']:+.2f} μs** (微秒级平稳) | < 10.0 μs | 🟢 卓越 |
 | **P99 长尾延迟** | **{metrics['latest']['p99_us']:.2f} μs** | 均值: **{metrics['avg_p99']:.2f} μs** | 平稳无 GC 导致的百毫秒毛刺 | < 5.0 ms | 🟢 卓越 |
 | **P99.9 极端延迟** | **{metrics['latest']['p999_us']:.2f} μs** | 均值: **{metrics['avg_p999']:.2f} μs** | 包含崩溃重载时的平滑过渡 | < 20.0 ms | 🟢 卓越 |
